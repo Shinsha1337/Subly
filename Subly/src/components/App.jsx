@@ -3,7 +3,21 @@ import SettingsModal from './SettingsModal';
 import TitleBar from './TitleBar';
 import ControlPanel from './ControlPanel';
 import EditorPane from './EditorPane';
+import { Close } from './Icons';
 import { smartRegroupSubs, applyFormatting } from '../logic/subtitle';
+
+// One label per `busy` value — the overlay names the operation instead of
+// leaving the panel greyed out with no explanation.
+const BUSY_LABELS = {
+    templates: 'Loading templates…',
+    tracks: 'Loading subtitle tracks…',
+    preview: 'Setting preview caption…',
+    transcribe: 'Transcribing audio…',
+    pull: 'Loading subtitles…',
+    apply: 'Applying to Resolve…',
+    phrases: 'Creating phrases…',
+    captions: 'Creating captions…'
+};
 
 export default function App() {
     const [status, setStatus] = useState('checking'); // checking | connected | disconnected
@@ -15,6 +29,8 @@ export default function App() {
 
     // config / presets
     const [cfg, setCfg] = useState(null);
+    const [updateInfo, setUpdateInfo] = useState(null);
+    const [updateDismissed, setUpdateDismissed] = useState(false);
 
     // template tab
     const [templates, setTemplates] = useState([]);
@@ -28,10 +44,11 @@ export default function App() {
     // deliver / editor - two separate states
     const [originalBlocks, setOriginalBlocks] = useState([]); // Transcription tab
     const [phrasesBlocks, setPhrasesBlocks] = useState([]); // Deliver tab
-    const [phrasesMode, setPhrasesMode] = useState(null); // modeIdx used at last Create Phrases (controls Deliver editor UX)
     const [loadToken, setLoadToken] = useState(0); // bumped when blocks load from outside → resets editor undo history
     const [busy, setBusy] = useState('');
+    const [busyVisible, setBusyVisible] = useState(false);
     const [errorModal, setErrorModal] = useState(null);
+    const [confirmModal, setConfirmModal] = useState(null);
 
     // live-tunable settings (mirror preset, editable in Deliver)
     const [size, setSize] = useState(0.07);
@@ -88,6 +105,14 @@ export default function App() {
         setPhrasesBlocks(next);
     }, []);
 
+    // config:set merges a PARTIAL patch on the main side and returns the merged
+    // result. Never send a whole cfg snapshot from here: DeliverToolbar saves
+    // emphasis_colors / favorite_fonts on its own, and a snapshot taken at mount
+    // would silently overwrite everything it wrote since.
+    const saveCfg = useCallback((patch) => (
+        window.configAPI.set(patch).then(saved => { if (saved) setCfg(saved); }).catch(() => {})
+    ), []);
+
     useEffect(() => {
         cfgRef.current = cfg;
         leftPanelWidthRef.current = leftPanelWidth;
@@ -107,18 +132,41 @@ export default function App() {
         return () => {
             clearInterval(id);
             if (cfgRef.current) {
+                // Unmounting — patch only the geometry we own. No setCfg here.
                 window.windowAPI.getState?.().then(state => {
-                    const next = {
-                        ...cfgRef.current,
+                    window.configAPI.set({
                         left_panel_width: leftPanelWidthRef.current,
                         window_width: state.width,
                         window_height: state.height
-                    };
-                    window.configAPI.set(next);
+                    });
                 }).catch(() => {});
             }
         };
+        // This is intentionally the one-time bootstrap/teardown effect. The
+        // called actions read their initial state and must not restart polling
+        // whenever a render creates fresh function identities.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+
+    // Windows draws the caption buttons itself (titleBarOverlay in main.js) —
+    // send the ACTIVE theme's titlebar colors. Both matter: symbolColor themes
+    // the glyphs, color's RGB picks the hover shade (main applies it with a 00
+    // alpha so nothing is actually painted). getComputedStyle forces a sync
+    // style recalc, so this already sees a just-set data-theme attribute.
+    function syncTitleBarOverlay() {
+        if (window.windowAPI.platform !== 'win32' || !window.windowAPI.setTitleBarOverlay) return;
+        const el = document.querySelector('.titlebar');
+        if (!el) return;
+        const toHex = (css) => {
+            const m = String(css || '').match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+            if (!m) return null;
+            return '#' + [m[1], m[2], m[3]].map(n => Number(n).toString(16).padStart(2, '0')).join('');
+        };
+        const cs = getComputedStyle(el);
+        const color = toHex(cs.backgroundColor);
+        const symbolColor = toHex(cs.color);
+        if (color && symbolColor) window.windowAPI.setTitleBarOverlay({ color, symbolColor });
+    }
 
     function applyTheme(t) {
         setTheme(t);
@@ -127,13 +175,12 @@ export default function App() {
             const mq = window.matchMedia('(prefers-color-scheme: dark)');
             document.documentElement.setAttribute('data-theme', mq.matches ? 'dark' : 'light');
         }
+        syncTitleBarOverlay();
     }
 
     function handleThemeChange(t) {
         applyTheme(t);
-        const next = { ...cfgRef.current, theme: t };
-        setCfg(next);
-        window.configAPI.set(next);
+        saveCfg({ theme: t });
     }
 
     function applyConfig(loaded) {
@@ -170,6 +217,7 @@ export default function App() {
         const mq = window.matchMedia('(prefers-color-scheme: dark)');
         const onChange = () => {
             document.documentElement.setAttribute('data-theme', mq.matches ? 'dark' : 'light');
+            syncTitleBarOverlay();
         };
         mq.addEventListener('change', onChange);
         return () => mq.removeEventListener('change', onChange);
@@ -260,23 +308,18 @@ export default function App() {
             window.removeEventListener('pointercancel', handlePointerUp);
 
             if (cfgRef.current) {
-                window.windowAPI.getState?.().then(state => {
-                    const next = {
-                        ...cfgRef.current,
-                        left_panel_width: leftPanelWidthRef.current,
-                        window_width: state.width,
-                        window_height: state.height
-                    };
-                    setCfg(next);
-                    window.configAPI.set(next);
-                });
+                window.windowAPI.getState?.().then(state => saveCfg({
+                    left_panel_width: leftPanelWidthRef.current,
+                    window_width: state.width,
+                    window_height: state.height
+                }));
             }
         };
 
         window.addEventListener('pointermove', handlePointerMove);
         window.addEventListener('pointerup', handlePointerUp);
         window.addEventListener('pointercancel', handlePointerUp);
-    }, [leftPanelWidth, getMaxLeftPanelWidth]);
+    }, [leftPanelWidth, getMaxLeftPanelWidth, saveCfg]);
 
     useEffect(() => {
         const handleResize = () => {
@@ -288,15 +331,10 @@ export default function App() {
 
         const saveWindowSize = () => {
             if (!cfgRef.current) return;
-            window.windowAPI.getState?.().then(state => {
-                const next = {
-                    ...cfgRef.current,
-                    window_width: state.width,
-                    window_height: state.height
-                };
-                setCfg(next);
-                window.configAPI.set(next);
-            });
+            window.windowAPI.getState?.().then(state => saveCfg({
+                window_width: state.width,
+                window_height: state.height
+            }));
         };
 
         window.addEventListener('resize', handleResize);
@@ -306,7 +344,7 @@ export default function App() {
             window.removeEventListener('resize', handleResize);
             clearTimeout(resizeTimer);
         };
-    }, [leftPanelWidth, getMaxLeftPanelWidth]);
+    }, [leftPanelWidth, getMaxLeftPanelWidth, saveCfg]);
 
     // ---------------------------------------------------------------- actions
     // Every long action takes the single `busy` lock (any non-empty value blocks
@@ -336,7 +374,14 @@ export default function App() {
     }
 
     async function setPreviewCaption() {
-        if (!template || busy) return;
+        if (busy) return;
+        if (!template) {
+            setErrorModal({
+                title: 'No Text+ template selected',
+                body: 'Pick a Text+ generator from the Media Pool first, or click the folder icon to import the bundled Subly bin.'
+            });
+            return;
+        }
         setBusy('preview');
         try {
             // Drop any existing preview first so successive clicks don't stack
@@ -351,10 +396,14 @@ export default function App() {
     }
 
     async function refreshTracks() {
-        const res = await window.resolveAPI.getSubtitleTracks();
-        if (!guard(res)) return;
-        setTracks(res.tracks || []);
-        if (res.tracks?.length && track == null) setTrack(res.tracks[0].idx);
+        if (busy) return;
+        setBusy('tracks');
+        try {
+            const res = await window.resolveAPI.getSubtitleTracks();
+            if (!guard(res)) return;
+            setTracks(res.tracks || []);
+            if (res.tracks?.length && track == null) setTrack(res.tracks[0].idx);
+        } finally { setBusy(''); }
     }
 
     async function transcribe() {
@@ -395,7 +444,30 @@ export default function App() {
         } finally { setBusy(''); }
     }
 
-    async function pullFromResolve() {
+    // Pull overwrites originalBlocks, so any manual edits made in the
+    // Transcription editor are gone. Confirm before throwing them away.
+    function pullFromResolve() {
+        if (busy) return;
+        if (track == null) {
+            setErrorModal({
+                title: 'No subtitle track selected',
+                body: 'Pick a subtitle track above, or click Refresh if the list is empty.'
+            });
+            return;
+        }
+        if (originalBlocksRef.current.length) {
+            setConfirmModal({
+                title: 'Replace the loaded subtitles?',
+                body: 'Pulling reloads this track from DaVinci Resolve and discards every edit you made in the Transcription editor. This cannot be undone.',
+                confirmLabel: 'Pull and replace',
+                onConfirm: runPullFromResolve
+            });
+            return;
+        }
+        runPullFromResolve();
+    }
+
+    async function runPullFromResolve() {
         if (track == null || busy) return;
         setBusy('pull');
         try {
@@ -407,7 +479,14 @@ export default function App() {
     }
 
     async function applyToResolve() {
-        if (track == null || busy) return;
+        if (busy) return;
+        if (track == null) {
+            setErrorModal({
+                title: 'No subtitle track selected',
+                body: 'Pick the subtitle track the edits should be written back to.'
+            });
+            return;
+        }
         setBusy('apply');
         try {
             // Run the live formatting (case + punctuation) over the raw edits
@@ -423,18 +502,35 @@ export default function App() {
         } finally { setBusy(''); }
     }
 
-    async function createPhrases() {
-        if (track == null || busy) return;
+    // Re-grouping rebuilds every phrase from originalBlocks, so per-word
+    // Emphasis, manual splits/merges and spelling fixes in Deliver are lost —
+    // and the editor's undo stack was already reset by the tab switch.
+    function createPhrases() {
+        if (busy) return;
+        if (!originalBlocksRef.current.length) {
+            setErrorModal({ title: 'No subtitles to phrase', body: 'Transcribe or pull subtitles from Resolve first.' });
+            return;
+        }
+        if (phrasesBlocksRef.current.length) {
+            setConfirmModal({
+                title: 'Rebuild all phrases?',
+                body: 'Every phrase is regrouped from scratch. Manual splits and merges, spelling fixes and per-word Emphasis in Deliver will be lost. This cannot be undone.',
+                confirmLabel: 'Rebuild phrases',
+                onConfirm: runCreatePhrases
+            });
+            return;
+        }
+        runCreatePhrases();
+    }
+
+    async function runCreatePhrases() {
+        if (busy) return;
         setBusy('phrases');
         try {
             const sourceBlocks = originalBlocksRef.current;
-            if (!sourceBlocks.length) {
-                setErrorModal({ title: 'No subtitles to phrase', body: 'Transcribe or pull subtitles from Resolve first.' });
-                return;
-            }
+            if (!sourceBlocks.length) return;
             const grouped = smartRegroupSubs(sourceBlocks, modeIdx, maxWords, maxChars, { wsMaxChars: wsChars });
             updatePhrasesBlocks(grouped);
-            setPhrasesMode(modeIdx);
             setLoadToken(t => t + 1);
 
             // Recreate the Preview Caption seeded with the LONGEST phrase, so the
@@ -454,8 +550,22 @@ export default function App() {
     }
 
     async function createCaptions() {
+        if (busy) return;
         const sourceBlocks = phrasesBlocksRef.current;
-        if (!template || !sourceBlocks.length || busy) return;
+        if (!template) {
+            setErrorModal({
+                title: 'No Text+ template selected',
+                body: 'Go back to the Template tab and pick the Text+ generator the captions should be built from.'
+            });
+            return;
+        }
+        if (!sourceBlocks.length) {
+            setErrorModal({
+                title: 'No phrases to deliver',
+                body: 'Create phrases on the Transcription tab first.'
+            });
+            return;
+        }
         const formatted = applyFormatting(sourceBlocks, getFmt());
         setBusy('captions');
         try {
@@ -469,7 +579,18 @@ export default function App() {
                 fallbackX: posX,
                 fallbackY: posY
             });
-            guard(res);
+            if (!guard(res)) return;
+            const created = Number(res?.created);
+            const requested = Number(res?.requested);
+            if (Number.isFinite(created) && Number.isFinite(requested)) {
+                const complete = created === requested;
+                setErrorModal({
+                    title: complete ? 'Captions created' : 'Some captions could not be created',
+                    body: complete
+                        ? `Created ${created} caption${created === 1 ? '' : 's'} on a new video track.`
+                        : `Created ${created} of ${requested} requested captions. Check the timeline and the selected Text+ template.`
+                });
+            }
         } finally { setBusy(''); }
     }
 
@@ -495,13 +616,52 @@ export default function App() {
         await window.resolveAPI.setPlayhead(block.start);
     }
 
+    // Every busy state gets the blocking overlay, but only once the operation
+    // has actually lasted a moment — otherwise a fast template/track refresh
+    // flashes it for a single frame.
+    useEffect(() => {
+        if (!busy) { setBusyVisible(false); return undefined; }
+        const id = setTimeout(() => setBusyVisible(true), 250);
+        return () => clearTimeout(id);
+    }, [busy]);
+
+    // Escape dismisses either modal. Confirm always cancels — never confirms.
+    useEffect(() => {
+        if (!errorModal && !confirmModal) return undefined;
+        const onKey = (e) => {
+            if (e.key !== 'Escape') return;
+            e.stopPropagation();
+            if (confirmModal) setConfirmModal(null);
+            else setErrorModal(null);
+        };
+        document.addEventListener('keydown', onKey);
+        return () => document.removeEventListener('keydown', onKey);
+    }, [errorModal, confirmModal]);
+
     useEffect(() => {
         if (!cfg || cfg.language === language) return;
-        const next = { ...cfg, language };
-        setCfg(next);
-        window.configAPI.set(next);
+        saveCfg({ language });
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [language]);
+
+    // Check once at startup and periodically while the plugin stays open. The
+    // main process owns the network request; a failure never blocks the editor.
+    useEffect(() => {
+        let active = true;
+        const checkForUpdate = async () => {
+            if (!window.updateAPI?.check) return;
+            const result = await window.updateAPI.check().catch(() => null);
+            if (!active || !result?.ok || !result.updateAvailable) return;
+            setUpdateInfo(result);
+            setUpdateDismissed(false);
+        };
+        checkForUpdate();
+        const timer = setInterval(checkForUpdate, 6 * 60 * 60 * 1000);
+        return () => {
+            active = false;
+            clearInterval(timer);
+        };
+    }, []);
 
     return (
         <div className="app">
@@ -513,6 +673,25 @@ export default function App() {
                 theme={theme}
                 onThemeChange={handleThemeChange}
             />
+
+            {updateInfo?.updateAvailable && !updateDismissed && (
+                <div className="update-banner" role="status" aria-live="polite">
+                    <span>Subly {updateInfo.latestVersion} is available</span>
+                    <button
+                        className="update-open"
+                        onClick={() => window.windowAPI.openExternal(updateInfo.releaseUrl)}
+                    >
+                        View release
+                    </button>
+                    <button
+                        className="update-dismiss"
+                        aria-label="Dismiss update notification"
+                        onClick={() => setUpdateDismissed(true)}
+                    >
+                        <Close />
+                    </button>
+                </div>
+            )}
 
             <div className="body editor-open">
                 <ControlPanel
@@ -562,6 +741,7 @@ export default function App() {
                     setMaxFrames={setMaxFrames}
                     createCaptions={createCaptions}
                     busy={busy}
+                    connected={status === 'connected'}
                     hasOriginalBlocks={originalBlocks.length > 0}
                     hasPhrasesBlocks={phrasesBlocks.length > 0}
                 />
@@ -583,7 +763,6 @@ export default function App() {
                     setOriginalBlocks={updateOriginalBlocks}
                     syncPlayhead={syncPlayhead}
                     loadToken={loadToken}
-                    phrasesMode={phrasesMode}
                     deliverSection={deliverSection}
                     setDeliverSection={setDeliverSection}
                     phrasesTool={phrasesTool}
@@ -593,15 +772,15 @@ export default function App() {
                 />
             </div>
 
-            {(busy === 'transcribe' || busy === 'captions') && (
-                <div className="busy-overlay">
+            {busy && busyVisible && (
+                <div className="busy-overlay" role="status" aria-live="polite">
                     <div className="busy-spinner">
                         <span /><span /><span />
                         <div className="busy-core" />
                     </div>
                     <div className="busy-label-wrap">
                         <div className="busy-label">
-                            {busy === 'transcribe' ? 'Transcribing audio…' : 'Creating captions…'}
+                            {BUSY_LABELS[busy] || 'Working…'}
                         </div>
                     </div>
                 </div>
@@ -618,10 +797,47 @@ export default function App() {
 
             {errorModal && (
                 <div className="modal-overlay" onClick={() => setErrorModal(null)}>
-                    <div className="modal error-modal" onClick={e => e.stopPropagation()}>
+                    <div
+                        className="modal error-modal"
+                        role="alertdialog"
+                        aria-modal="true"
+                        aria-label={errorModal.title}
+                        onClick={e => e.stopPropagation()}
+                    >
                         <h2>{errorModal.title}</h2>
                         <p className="error-modal-body">{errorModal.body}</p>
-                        <button className="btn-primary" onClick={() => setErrorModal(null)}>OK</button>
+                        <button className="btn-primary" autoFocus onClick={() => setErrorModal(null)}>OK</button>
+                    </div>
+                </div>
+            )}
+
+            {confirmModal && (
+                <div className="modal-overlay" onClick={() => setConfirmModal(null)}>
+                    <div
+                        className="modal error-modal"
+                        role="alertdialog"
+                        aria-modal="true"
+                        aria-label={confirmModal.title}
+                        onClick={e => e.stopPropagation()}
+                    >
+                        <h2>{confirmModal.title}</h2>
+                        <p className="error-modal-body">{confirmModal.body}</p>
+                        {/* Confirm first, Cancel second — the Windows order.
+                            Cancel still takes initial focus so Enter and Escape
+                            both back out of a destructive action. */}
+                        <div className="modal-actions">
+                            <button
+                                className="btn-primary"
+                                onClick={() => {
+                                    const run = confirmModal.onConfirm;
+                                    setConfirmModal(null);
+                                    run?.();
+                                }}
+                            >
+                                {confirmModal.confirmLabel || 'Continue'}
+                            </button>
+                            <button className="btn-gray" autoFocus onClick={() => setConfirmModal(null)}>Cancel</button>
+                        </div>
                     </div>
                 </div>
             )}

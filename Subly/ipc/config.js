@@ -85,6 +85,14 @@ function readStored() {
         return JSON.parse(txt);
     } catch (e) {
         try { fs.renameSync(file, file + '.corrupt-' + Date.now()); } catch { /* */ }
+        const backup = file + '.bak';
+        try {
+            if (fs.existsSync(backup)) {
+                const restored = JSON.parse(fs.readFileSync(backup, 'utf-8'));
+                fs.copyFileSync(backup, file);
+                return restored;
+            }
+        } catch { /* invalid backup; fall through to defaults */ }
         throw e;
     }
 }

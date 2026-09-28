@@ -600,6 +600,38 @@ if not dir_writable(dest_root) then
     return
 end
 
+-- 5b. Refuse to install a folder into itself.
+-- dest_root comes from an editable field in the setup dialog, and
+-- find_plugin_source() accepts ANY folder holding a manifest.xml — including
+-- the one the user typed. So dest_dir can legitimately end up equal to (or
+-- containing) plugin_src: the release unpacked straight into the plugins
+-- folder, or the path of an already-installed copy pasted back in. The
+-- rmtree(dest_dir) below would then delete the only copy BEFORE anything is
+-- copied, and silently: copy_tree just returns when the source is gone, so
+-- copy_errors stays empty and the log still prints "copied ...".
+local function path_key(p)
+    local k = norm(p):gsub("[/\\]+$", "")
+    if is_win then k = k:lower() end
+    -- Trailing separator so ".../Sub" is not treated as a prefix of ".../Subly".
+    return k .. sep
+end
+local src_key, dst_key = path_key(plugin_src), path_key(dest_dir)
+if src_key == dst_key
+    or src_key:sub(1, #dst_key) == dst_key
+    or dst_key:sub(1, #src_key) == src_key then
+    fail("Refusing to install: the source and destination are the same folder,")
+    fail("or one of them contains the other.")
+    fail("  source:      " .. plugin_src)
+    fail("  destination: " .. dest_dir)
+    fail("Move the extracted project elsewhere (for example the Desktop) and run")
+    fail("install.lua from there.")
+    notify("Subly — install failed",
+        "The install source and destination are the same folder.\n" ..
+        "Move the extracted Subly project outside the Workflow Integration\n" ..
+        "Plugins folder, then run install.lua again.")
+    return
+end
+
 -- 6. Install — direct copy. Old / legacy / user-local folders are cleaned up.
 for _, path in ipairs(legacy_dest_dirs) do
     if path ~= dest_dir then rmtree(path) end

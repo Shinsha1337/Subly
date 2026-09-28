@@ -170,45 +170,6 @@ function ChildRow({ options, values, onChange, multi }) {
     );
 }
 
-function MenuSelect({ value, options, onChange, placeholder = 'Select...', className = '' }) {
-    const [open, setOpen] = React.useState(false);
-    const ref = React.useRef(null);
-
-    React.useEffect(() => {
-        if (!open) return undefined;
-        const onDoc = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
-        document.addEventListener('mousedown', onDoc);
-        return () => document.removeEventListener('mousedown', onDoc);
-    }, [open]);
-
-    const current = options.find(o => String(o.value) === String(value));
-    return (
-        <div className={'dt-sel ' + className + (open ? ' open' : '')} ref={ref}>
-            <button
-                type="button"
-                className="dt-sel-trigger"
-                onClick={() => setOpen(o => !o)}
-                style={className.includes('font') && value ? { fontFamily: value } : undefined}
-            >
-                <span>{current ? current.label : placeholder}</span>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M6 9l6 6 6-6" /></svg>
-            </button>
-            {open && (
-                <div className="dt-sel-menu">
-                    {options.map(o => (
-                        <div
-                            key={String(o.value)}
-                            className={'dt-sel-opt' + (String(o.value) === String(value) ? ' active' : '')}
-                            style={className.includes('font') && o.value ? { fontFamily: o.value } : undefined}
-                            onClick={() => { onChange(o.value); setOpen(false); }}
-                        >{o.label}</div>
-                    ))}
-                </div>
-            )}
-        </div>
-    );
-}
-
 function ColorPickerPanel({ value, onChange, savedColors, onSaveColor, onDeleteColor, onClose, panelRef, style }) {
     const normalized = normalizeHex(value);
     const [hsv, setHsv] = React.useState(() => rgbToHsv(hexToRgb(normalized)));
@@ -258,9 +219,11 @@ function ColorPickerPanel({ value, onChange, savedColors, onSaveColor, onDeleteC
 
     return (
         <div ref={panelRef} className="dt-color-popover" role="dialog" aria-label="Emphasis color picker" style={style}>
+            {/* Corner close, same quiet-chrome pattern as the settings modal:
+                absolute in the popover's padding, not squeezed into the title row. */}
+            <button type="button" className="dt-color-close" onClick={onClose} aria-label="Close color picker">×</button>
             <div className="dt-color-popover-head">
                 <span>Emphasis Color</span>
-                <button type="button" className="dt-color-close" onClick={onClose} aria-label="Close color picker">×</button>
             </div>
 
             <div

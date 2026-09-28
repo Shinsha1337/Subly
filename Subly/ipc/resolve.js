@@ -313,16 +313,27 @@ async function transcribeAudio({ language, charsPerLine }) {
 // ---------------------------------------------------------------- preview caption
 
 async function deletePreviewCaptionImpl(timeline) {
-    const clips = [];
     const count = (await timeline.GetTrackCount('video')) || 0;
-    for (let i = 1; i <= count; i++) {
+    let deleted = 0;
+    // Walk downward because deleting a track shifts every higher index down.
+    for (let i = count; i >= 1; i--) {
         const items = (await timeline.GetItemListInTrack('video', i)) || [];
-        for (const item of items) {
-            if ((await item.GetName()) === PREVIEW_NAME) clips.push(item);
+        const clips = [];
+        for (const item of items) if ((await item.GetName()) === PREVIEW_NAME) clips.push(item);
+        if (!clips.length) continue;
+
+        await timeline.DeleteClips(clips);
+        deleted += clips.length;
+        // Preview Caption owns its temporary track. Do not leave an empty video
+        // track behind after Set Preview Caption is replaced or removed.
+        const remaining = (await timeline.GetItemListInTrack('video', i)) || [];
+        if (!remaining.length && typeof timeline.DeleteTrack === 'function') {
+            try { await timeline.DeleteTrack('video', i); } catch { /* best-effort */ }
         }
+        // There is only one preview track in normal use, but continue downward
+        // so older duplicate preview clips are cleaned up as well.
     }
-    if (clips.length > 0) await timeline.DeleteClips(clips);
-    return clips.length;
+    return deleted;
 }
 
 async function createPreviewCaption(templateName) {
@@ -401,7 +412,7 @@ async function deletePreviewCaption() {
 // ---------------------------------------------------------------- send titles
 
 // Create Captions: routed entirely through the Lua bridge. The Lua side places
-// the templates, sets each clip's Text+/AutoSubs text (with per-word timing
+// the templates, sets each clip's Text+/SmartSubs text (with per-word timing
 // animation when blocks carry a `words` array), disables the source track and
 // cleans up empty tracks — none of which WorkflowIntegration.node can do
 // reliably. One-shot: fuscript is killed as soon as this returns.
@@ -442,21 +453,34 @@ async function diagnoseFusion() {
 // ---------------------------------------------------------------- registration
 
 function setupResolveHandlers(ipcMain) {
-    ipcMain.handle('resolve:connect', () => connect());
-    ipcMain.handle('resolve:ping', () => ping());
-    ipcMain.handle('resolve:getTimelineSettings', () => getTimelineSettings());
-    ipcMain.handle('resolve:getFusionTemplates', () => getFusionTemplates());
-    ipcMain.handle('resolve:importTemplateBin', () => importTemplateBin());
-    ipcMain.handle('resolve:getSubtitleTracks', () => getSubtitleTracks());
-    ipcMain.handle('resolve:getSubtitlesFromTrack', (_e, trackIndex) => getSubtitlesFromTrack(trackIndex));
-    ipcMain.handle('resolve:applySubtitlesToTrack', (_e, payload) => applySubtitlesToTrack(payload));
-    ipcMain.handle('resolve:transcribeAudio', (_e, payload) => transcribeAudio(payload));
-    ipcMain.handle('resolve:createPreviewCaption', (_e, name) => createPreviewCaption(name));
-    ipcMain.handle('resolve:updatePreviewCaption', (_e, payload) => updatePreviewCaption(payload));
-    ipcMain.handle('resolve:deletePreviewCaption', () => deletePreviewCaption());
-    ipcMain.handle('resolve:sendFusionTextTitles', (_e, payload) => sendFusionTextTitles(payload));
-    ipcMain.handle('resolve:setPlayhead', (_e, tc) => setPlayhead(tc));
-    ipcMain.handle('resolve:diagnoseFusion', () => diagnoseFusion());
+    const handle = (channel, handler) => {
+        ipcMain.handle(channel, async (...args) => {
+            try {
+                return await handler(...args);
+            } catch (error) {
+                return {
+                    error: 'Resolve operation failed',
+                    detail: String(error?.message || error || 'Unknown error')
+                };
+            }
+        });
+    };
+
+    handle('resolve:connect', () => connect());
+    handle('resolve:ping', () => ping());
+    handle('resolve:getTimelineSettings', () => getTimelineSettings());
+    handle('resolve:getFusionTemplates', () => getFusionTemplates());
+    handle('resolve:importTemplateBin', () => importTemplateBin());
+    handle('resolve:getSubtitleTracks', () => getSubtitleTracks());
+    handle('resolve:getSubtitlesFromTrack', (_e, trackIndex) => getSubtitlesFromTrack(trackIndex));
+    handle('resolve:applySubtitlesToTrack', (_e, payload) => applySubtitlesToTrack(payload));
+    handle('resolve:transcribeAudio', (_e, payload) => transcribeAudio(payload));
+    handle('resolve:createPreviewCaption', (_e, name) => createPreviewCaption(name));
+    handle('resolve:updatePreviewCaption', (_e, payload) => updatePreviewCaption(payload));
+    handle('resolve:deletePreviewCaption', () => deletePreviewCaption());
+    handle('resolve:sendFusionTextTitles', (_e, payload) => sendFusionTextTitles(payload));
+    handle('resolve:setPlayhead', (_e, tc) => setPlayhead(tc));
+    handle('resolve:diagnoseFusion', () => diagnoseFusion());
 }
 
 module.exports = { setupResolveHandlers, cleanupResolveInterface, killLuaBridge: luaBridge.killServer };

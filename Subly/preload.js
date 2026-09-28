@@ -44,6 +44,10 @@ contextBridge.exposeInMainWorld('configAPI', {
     set: (partial) => ipcRenderer.invoke('config:set', partial)
 });
 
+contextBridge.exposeInMainWorld('updateAPI', {
+    check: () => ipcRenderer.invoke('app:checkForUpdate')
+});
+
 contextBridge.exposeInMainWorld('windowAPI', {
     platform: process.platform,
     resize: ({ width, height }) => ipcRenderer.invoke('window:resize', { width, height }),
@@ -52,6 +56,11 @@ contextBridge.exposeInMainWorld('windowAPI', {
     toggleMaximize: () => ipcRenderer.invoke('window:toggleMaximize'),
     close: () => ipcRenderer.invoke('window:close'),
     getState: () => ipcRenderer.invoke('window:getState'),
+    // Windows only: re-theme the native caption buttons (titleBarOverlay).
+    // Payload: { color: '#rrggbb', symbolColor: '#rrggbb' } — titlebar bg and
+    // glyph color. Main paints the bg with a 00 alpha (nothing visible) and
+    // uses its RGB only to pick the buttons' hover shade.
+    setTitleBarOverlay: (overlay) => ipcRenderer.invoke('window:setTitleBarOverlay', overlay),
     // Pin the page zoom to native DPI (1.0) and clamp the zoom range to [1,1] so
     // pinch/Ctrl-wheel can't change it. We render at the monitor's DPI like the
     // PyQt build — no artificial zoom. Ctrl +/-/0 are blocked in main.js too.
@@ -68,6 +77,6 @@ contextBridge.exposeInMainWorld('windowAPI', {
         return () => ipcRenderer.removeListener('window:maximized', fn);
     },
     openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
-    openPath: (p) => ipcRenderer.invoke('shell:openPath', p),
+    getVersion: () => ipcRenderer.invoke('app:getVersion'),
     getFonts: () => ipcRenderer.invoke('app:getFonts')
 });

@@ -1,7 +1,10 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execFileSync } = require('child_process');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+
+const execFileAsync = promisify(execFile);
 
 const FONT_FILE = /\.(ttf|otf|ttc)$/i;
 const REGISTRY_KIND_SUFFIX = /\s*\((TrueType|OpenType|Type 1|Raster|Collection)\)\s*$/i;
@@ -100,9 +103,7 @@ function readSfntFace(buffer, sfntOffset) {
     return family ? { family, style: style || 'Regular' } : null;
 }
 
-function readFontFaces(filePath) {
-    let buffer;
-    try { buffer = fs.readFileSync(filePath); } catch { return []; }
+function parseFontBuffer(buffer) {
     if (buffer.length < 12) return [];
 
     const offsets = [];
@@ -118,6 +119,20 @@ function readFontFaces(filePath) {
     }
 
     return offsets.map(offset => readSfntFace(buffer, offset)).filter(Boolean);
+}
+
+// A truncated or corrupt font can still make the offset arithmetic read past
+// the buffer — swallow it per file so one bad file can't abort the whole scan.
+function readFontFaces(filePath) {
+    let buffer;
+    try { buffer = fs.readFileSync(filePath); } catch { return []; }
+    try { return parseFontBuffer(buffer); } catch { return []; }
+}
+
+async function readFontFacesAsync(filePath) {
+    let buffer;
+    try { buffer = await fs.promises.readFile(filePath); } catch { return []; }
+    try { return parseFontBuffer(buffer); } catch { return []; }
 }
 
 function readFontFamilies(filePath) {
@@ -184,16 +199,26 @@ function fontDirectories() {
     return ['/usr/share/fonts', '/usr/local/share/fonts', path.join(os.homedir(), '.fonts')];
 }
 
-function getWindowsRegistryFonts() {
+// System32 tools must be launched by absolute path: resolving "reg" through
+// PATH would let a planted reg.exe earlier in PATH run inside Resolve's process.
+function systemToolPath(exeName) {
+    return path.join(process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows', 'System32', exeName);
+}
+
+async function getWindowsRegistryFonts() {
     const entries = [];
+    const reg = systemToolPath('reg.exe');
     for (const hive of ['HKLM', 'HKCU']) {
         try {
-            const output = execFileSync(
-                'reg',
+            // Deliberately no windowsHide: with no console attached reg.exe
+            // transliterates non-ASCII to '?', which breaks the file paths of
+            // fonts installed under a Cyrillic/CJK name.
+            const { stdout } = await execFileAsync(
+                reg,
                 ['query', `${hive}\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts`],
                 { encoding: 'utf8', timeout: 3000 }
             );
-            output.split(/\r?\n/).forEach(line => {
+            stdout.split(/\r?\n/).forEach(line => {
                 const match = line.match(/^\s+(.+?)\s+REG_(?:SZ|EXPAND_SZ)\s+(.+?)\s*$/);
                 if (match) entries.push({ displayName: match[1], file: match[2] });
             });
@@ -202,41 +227,129 @@ function getWindowsRegistryFonts() {
     return entries;
 }
 
-function getSystemFonts() {
+// Windows paths are case-insensitive and the registry spells them differently
+// from the directory walk, so fold case before comparing.
+function fontPathKey(filePath) {
+    const resolved = path.resolve(filePath);
+    return process.platform === 'win32' ? resolved.toLocaleLowerCase() : resolved;
+}
+
+async function scanSystemFonts() {
     const faces = [];
     const addFace = face => { if (face?.family) faces.push(face); };
-    const addFromFile = (filePath) => {
-        const parsed = readFontFaces(filePath);
+    // The registry entries point straight into %WINDIR%\Fonts, which is also the
+    // first directory walked below — without this map every file there would be
+    // opened and parsed twice.
+    const parsedFiles = new Map();
+    const addFromFile = async (filePath) => {
+        const key = fontPathKey(filePath);
+        if (parsedFiles.has(key)) return parsedFiles.get(key);
+        const parsed = await readFontFacesAsync(filePath);
         parsed.forEach(addFace);
+        parsedFiles.set(key, parsed.length > 0);
         return parsed.length > 0;
     };
     const directories = fontDirectories();
 
     if (process.platform === 'win32') {
         const systemFontsDir = directories[0];
-        for (const entry of getWindowsRegistryFonts()) {
+        for (const entry of await getWindowsRegistryFonts()) {
             if (/\.fon$/i.test(entry.file)) continue;
             const expanded = entry.file.replace(/%([^%]+)%/g, (_match, key) => process.env[key] || '');
             const filePaths = path.isAbsolute(expanded)
                 ? [expanded]
                 : [path.join(systemFontsDir, expanded), path.join(directories[1], expanded)];
-            if (!filePaths.some(addFromFile)) addFace(parseFallbackFace(entry.displayName));
+            let parsed = false;
+            for (const filePath of filePaths) {
+                parsed = await addFromFile(filePath);
+                if (parsed) break;
+            }
+            if (!parsed) addFace(parseFallbackFace(entry.displayName));
         }
     }
 
-    const walk = (dir, depth = 0) => {
+    const walk = async (dir, depth = 0) => {
         if (depth > 3) return;
         let entries = [];
-        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+        try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
         for (const entry of entries) {
             const fullPath = path.join(dir, entry.name);
-            if (entry.isDirectory()) walk(fullPath, depth + 1);
-            else if (FONT_FILE.test(entry.name)) addFromFile(fullPath);
+            if (entry.isDirectory()) await walk(fullPath, depth + 1);
+            else if (FONT_FILE.test(entry.name)) await addFromFile(fullPath);
         }
     };
-    directories.forEach(dir => walk(dir));
+    for (const dir of directories) await walk(dir);
 
     return buildFontCatalog(faces);
+}
+
+// Installing or removing a font touches the mtime of the directory holding it,
+// so the directory stamps are enough to spot a stale catalogue without
+// stat'ing the thousands of files inside them.
+// A directory's mtime changes when a file is added directly inside it, but not
+// when one lands in a subdirectory — so the immediate children are stamped too.
+// That is one readdir plus a stat per child, still nothing next to parsing every
+// font file, and it keeps the signature cheap enough to compute on every call.
+async function fontDirectorySignature() {
+    const stamps = await Promise.all(fontDirectories().map(async (dir) => {
+        try {
+            const stats = await fs.promises.stat(dir);
+            let childStamp = '';
+            try {
+                const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+                const childTimes = await Promise.all(
+                    entries.filter(e => e.isDirectory()).map(async (e) => {
+                        try {
+                            const s = await fs.promises.stat(path.join(dir, e.name));
+                            return `${e.name}:${s.mtimeMs}`;
+                        } catch {
+                            return `${e.name}:-`;
+                        }
+                    })
+                );
+                childStamp = childTimes.sort().join(',');
+            } catch { /* unreadable dir — the parent stamp still covers it */ }
+            return `${dir}:${stats.mtimeMs}:${childStamp}`;
+        } catch {
+            return `${dir}:-`;
+        }
+    }));
+    return stamps.join('|');
+}
+
+// Backstop for changes no mtime reflects (a font replaced in place, a nested
+// tree deeper than one level). Cheap: it only forces one rescan per interval,
+// and only when the fonts are actually asked for.
+const CATALOG_TTL_MS = 60000;
+
+let cachedCatalog = null;
+let cachedSignature = null;
+let cachedAt = 0;
+let pendingScan = null;
+
+async function resolveFontCatalog(now) {
+    const signature = await fontDirectorySignature();
+    const fresh = cachedCatalog
+        && signature === cachedSignature
+        && (now - cachedAt) < CATALOG_TTL_MS;
+    if (fresh) return cachedCatalog;
+    const catalog = await scanSystemFonts();
+    cachedCatalog = catalog;
+    cachedSignature = signature;
+    cachedAt = now;
+    return catalog;
+}
+
+// The Deliver toolbar remounts on every tab switch and asks for the fonts each
+// time. Memoise the catalogue and share the in-flight promise — deliberately
+// not an async function, so the guard is set before the first await and two
+// overlapping calls can never start two scans.
+function getSystemFonts() {
+    if (!pendingScan) {
+        const now = Date.now();
+        pendingScan = resolveFontCatalog(now).finally(() => { pendingScan = null; });
+    }
+    return pendingScan;
 }
 
 module.exports = {

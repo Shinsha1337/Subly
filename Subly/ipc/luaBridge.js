@@ -1,7 +1,7 @@
 // Subly — Lua bridge (Node port of resolve_bridge.py)
 //
 // The WorkflowIntegration.node bridge cannot reliably reach tool-level Fusion
-// scripting (tool:SetInput on Text+/AutoSubs), so the Fusion-text operations go
+// scripting (tool:SetInput on Text+/SmartSubs), so the Fusion-text operations go
 // through the original Lua bridge instead. We spawn fuscript.exe running
 // subly_bridge_launcher.lua, which starts local HTTP JSON-RPC workers on
 // 127.0.0.1. Normal Resolve actions use the primary worker; realtime Text+

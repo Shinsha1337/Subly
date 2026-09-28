@@ -3,11 +3,26 @@
 
 const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const path = require('path');
-const { setupResolveHandlers, cleanupResolveInterface, killLuaBridge } = require('./ipc/resolve');
+const fs = require('fs');
+const { setupResolveHandlers, cleanupResolveInterface } = require('./ipc/resolve');
 const { setupConfigHandlers } = require('./ipc/config');
 const { getSystemFonts } = require('./ipc/fonts');
+const { createCleanupController } = require('./ipc/mainLifecycle');
+const { checkForUpdate } = require('./ipc/updates');
 
 let mainWindow = null;
+
+// The hosted plugin runs Resolve's own Electron binary, so app.getVersion()
+// reports DaVinci's version, not ours. package.json is the single source of
+// truth (it ships inside the plugin folder and manifest.xml bumps with it).
+function getAppVersion() {
+    try {
+        const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf-8'));
+        return String(pkg.version || app.getVersion());
+    } catch {
+        return app.getVersion();
+    }
+}
 
 function createWindow() {
     const isMac = process.platform === 'darwin';
@@ -20,7 +35,19 @@ function createWindow() {
         alwaysOnTop: false,
         frame: isMac,
         titleBarStyle: isMac ? 'hiddenInset' : 'hidden',
-        ...(isMac ? { trafficLightPosition: { x: 12, y: 10 } } : {}),
+        ...(isMac
+            ? { trafficLightPosition: { x: 12, y: 10 } }
+            // Windows Controls Overlay: the OS itself draws the caption buttons
+            // (min/max/close, incl. the Win11 snap flyout) over our titlebar,
+            // instead of the custom HTML buttons. The overlay color carries a
+            // 00 alpha: nothing is painted, so the titlebar (and its bottom
+            // border) shows through — but the RGB part still matters, because
+            // Chromium derives the buttons' hover shade from its luminance
+            // (light base -> dark hover, dark base -> light hover). Re-synced
+            // to the active theme via window:setTitleBarOverlay.
+            : process.platform === 'win32'
+                ? { titleBarOverlay: { color: '#11111100', symbolColor: '#e0e0e0', height: 36 } }
+                : {}),
         autoHideMenuBar: true,
         useContentSize: true,
         backgroundColor: '#0d0d0d',
@@ -159,17 +186,34 @@ app.whenReady().then(() => {
         if (mainWindow) mainWindow.close();
         return { closed: true };
     });
+    // The renderer (owner of the theme) sends the titlebar bg + text colors.
+    // The bg is applied with a 00 alpha: the overlay paints nothing (titlebar
+    // border stays visible), but Chromium still uses the RGB luminance to pick
+    // the hover shade for the caption buttons. Height lives here so it can't
+    // drift from the CSS titlebar. Win-only — other platforms never call this.
+    ipcMain.handle('window:setTitleBarOverlay', (_event, overlay) => {
+        if (process.platform !== 'win32' || !mainWindow) return;
+        const hex = (v) => (typeof v === 'string' && /^#[0-9a-fA-F]{6}$/.test(v) ? v : null);
+        const color = hex(overlay && overlay.color);
+        const symbolColor = hex(overlay && overlay.symbolColor);
+        if (color && symbolColor) mainWindow.setTitleBarOverlay({ color: color + '00', symbolColor, height: 36 });
+    });
     ipcMain.handle('window:getState', () => getWindowState());
-    ipcMain.handle('app:getFonts', () => getSystemFonts());
+    // Scanning the font library takes ~2s on a fat Windows install; awaiting the
+    // async scan keeps the main process repainting and answering other IPC while
+    // it runs (the result is memoised, so only the first call pays).
+    ipcMain.handle('app:getFonts', async () => await getSystemFonts());
+    ipcMain.handle('app:checkForUpdate', () => checkForUpdate(getAppVersion()));
+    ipcMain.handle('app:getVersion', () => getAppVersion());
     ipcMain.handle('shell:openExternal', (_event, url) => {
         // Only hand http(s)/mailto URLs to the OS — never file:, smb:, etc.
         if (typeof url === 'string' && /^(https?|mailto):/i.test(url)) {
             return shell.openExternal(url).catch(() => {});
         }
     });
-    ipcMain.handle('shell:openPath', (_event, p) => {
-        if (typeof p === 'string' && p) return shell.openPath(p);
-    });
+    // NOTE: there is deliberately no 'shell:openPath' handler. shell.openPath
+    // launches a local file with its OS default handler — a process-spawn
+    // primitive — and nothing in the renderer ever needed it.
 });
 
 function getWindowState() {
@@ -184,15 +228,13 @@ function getWindowState() {
 }
 
 app.on('window-all-closed', () => {
-    cleanupResolveInterface().catch(() => {});
     if (process.platform !== 'darwin') app.quit();
 });
 
-// Make sure the fuscript.exe Lua bridge never outlives the app, regardless of
-// how the app exits.
-app.on('before-quit', () => {
-    try { killLuaBridge(); } catch { /* best-effort */ }
-});
+// Repeated quit attempts are still cancelled while cleanup is in flight; only
+// the final app.quit() issued after cleanup is allowed through.
+const cleanupController = createCleanupController(cleanupResolveInterface, () => app.quit());
+app.on('before-quit', cleanupController.beforeQuit);
 
 app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

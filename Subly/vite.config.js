@@ -16,6 +16,21 @@ export default defineConfig({
                     if (existsSync(src)) copyFileSync(src, join(distAssets, name));
                 }
             }
+        },
+        {
+            // The CSP lives in dist/index.html only. Injected here because the
+            // dev server needs an open connect-src for its HMR websocket, while
+            // the production build inside Electron talks to nothing but IPC.
+            name: 'inject-csp',
+            apply: 'build',
+            transformIndexHtml(html) {
+                return html.replace(
+                    '<!--CSP-->',
+                    '<meta http-equiv="Content-Security-Policy"\n'
+                    + '        content="default-src \'none\'; script-src \'self\'; style-src \'self\' \'unsafe-inline\';'
+                    + ' img-src \'self\' data:; font-src \'self\'; connect-src \'none\'; base-uri \'none\'; form-action \'none\'" />'
+                );
+            }
         }
     ],
     root: 'src',

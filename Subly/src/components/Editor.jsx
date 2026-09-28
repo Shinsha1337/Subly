@@ -2,7 +2,7 @@ import React from 'react';
 import { flushSync } from 'react-dom';
 import { Undo, Redo, Search, Razor } from './Icons';
 import DeliverToolbar from './DeliverToolbar';
-import { tcToMs, msToTc, syncWordsToText, mergePhraseDown, splitPhraseAtWord } from '../logic/subtitle';
+import { tcToMs, msToTc, normalizeTimecode, isValidTimeRange, syncWordsToText, mergePhraseDown, splitPhraseAtWord } from '../logic/subtitle';
 
 // Stable per-block identity for React keys. Module-level so the counter never
 // resets across editor remounts (the editor is keyed by tab) and can't collide.
@@ -11,6 +11,16 @@ const nextBlockUid = () => 'blk' + (++__blockUid);
 
 // Counts visible characters, not UTF-16 code units — see subtitle.js#charLen.
 const charLen = (s) => [...String(s || '')].length;
+
+export function isTextEditingTarget(target) {
+    if (!target) return false;
+    const tag = String(target.tagName || '').toUpperCase();
+    return !!target.isContentEditable || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+}
+
+export function shouldResetEditorHistory(previousLoadToken, loadToken) {
+    return previousLoadToken !== loadToken;
+}
 
 function rewrapTextLikeOriginal(originalText, newWords) {
     const lines = String(originalText || '').split('\n');
@@ -38,19 +48,42 @@ const SubBlock = React.forwardRef(function SubBlock({ block, index, highlight, s
     const [editingWordIndex, setEditingWordIndex] = React.useState(null);
     const [editingText, setEditingText] = React.useState('');
     const editInputRef = React.useRef(null);
+    const [timecodes, setTimecodes] = React.useState(() => ({ start: block.start, end: block.end }));
+
+    React.useEffect(() => {
+        setTimecodes({ start: block.start, end: block.end });
+    }, [block.start, block.end]);
 
     const autosize = React.useCallback(() => {
         const el = textRef.current;
         if (!el) return;
         el.style.height = 'auto';
-        el.style.height = el.scrollHeight + 'px';
+        // scrollHeight covers content + padding but not the border, and the box
+        // is border-box — assigning it straight across clipped the last line by
+        // the border width, which shows up as a shaved descender.
+        const cs = getComputedStyle(el);
+        const border = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth);
+        el.style.height = (el.scrollHeight + (Number.isFinite(border) ? border : 0)) + 'px';
     }, []);
 
     React.useLayoutEffect(() => { autosize(); }, [block.text, autosize]);
 
     React.useImperativeHandle(ref, () => ({ autosize, el: textRef.current }), [autosize]);
 
-    const onTc = (field) => (e) => onChange(index, { [field]: e.target.value.replace(/[^0-9:,.]/g, '') });
+    const onTc = (field) => (e) => setTimecodes(prev => ({
+        ...prev,
+        [field]: e.target.value.replace(/[^0-9:,.]/g, '')
+    }));
+
+    const commitTimecodes = () => {
+        const start = normalizeTimecode(timecodes.start);
+        const end = normalizeTimecode(timecodes.end);
+        if (!start || !end || !isValidTimeRange(start, end)) {
+            setTimecodes({ start: block.start, end: block.end });
+            return;
+        }
+        onChange(index, { start, end });
+    };
 
     const handleEnterSplitMode = () => {
         setSplitPositions([]);
@@ -210,19 +243,23 @@ const SubBlock = React.forwardRef(function SubBlock({ block, index, highlight, s
                 <button className="sub-idx tip-start" data-tip="Sync playhead" onClick={() => onSync(block)}>#{index + 1}</button>
                 <input
                     className="tc-input"
-                    value={block.start}
+                    value={timecodes.start}
                     onChange={onTc('start')}
+                    onBlur={commitTimecodes}
                     inputMode="numeric"
                     spellCheck={false}
+                    aria-invalid={!isValidTimeRange(timecodes.start, timecodes.end)}
                     disabled={splitMode}
                 />
                 <span className="tc-arrow">→</span>
                 <input
                     className="tc-input"
-                    value={block.end}
+                    value={timecodes.end}
                     onChange={onTc('end')}
+                    onBlur={commitTimecodes}
                     inputMode="numeric"
                     spellCheck={false}
+                    aria-invalid={!isValidTimeRange(timecodes.start, timecodes.end)}
                     disabled={splitMode}
                 />
                 <div className="sub-actions">
@@ -411,6 +448,11 @@ const DeliverBlock = React.forwardRef(function DeliverBlock({
                                     className="group-split-gap"
                                     data-tip="Split here — tail goes down"
                                     aria-label="Split phrase here"
+                                    // One of these sits between every pair of words, so leaving
+                                    // them in the tab order buries the rest of the UI behind
+                                    // hundreds of stops on a real transcript. Pointer-only;
+                                    // the phrase-level Split button covers the same action.
+                                    tabIndex={-1}
                                     onClick={() => onSplitAt(index, i)}
                                 >
                                     <span className="group-split-bar" />
@@ -434,11 +476,12 @@ const DeliverBlock = React.forwardRef(function DeliverBlock({
     );
 });
 
-export default function Editor({ blocks, setBlocks, onSyncPlayhead, loadToken, readOnly, hideStructural, edgeDelete = false, countLabel = 'subtitles', deliverMode = false, deliverSection, setDeliverSection, phrasesTool, setPhrasesTool, emph, setEmph }) {
-    const undoStack = React.useRef([]);
-    const redoStack = React.useRef([]);
+export default function Editor({ blocks, setBlocks, onSyncPlayhead, loadToken, readOnly, hideStructural, edgeDelete = false, countLabel = 'subtitles', deliverMode = false, deliverSection, setDeliverSection, phrasesTool, setPhrasesTool, emph, setEmph, historyRef }) {
+    const localHistory = React.useRef({ undo: [], redo: [] });
+    const history = historyRef || localHistory.current;
     const burstOpen = React.useRef(false);   // a typing burst owns the latest undo entry
     const burstTimer = React.useRef(null);
+    const previousLoadToken = React.useRef(loadToken);
     const [, force] = React.useReducer((x) => x + 1, 0); // refresh enabled-state of undo/redo
 
     // search
@@ -513,23 +556,27 @@ export default function Editor({ blocks, setBlocks, onSyncPlayhead, loadToken, r
     // history and stamps a stable __uid on any block missing one, so React keys
     // follow the data through merge/split/delete instead of the array slot.
     React.useEffect(() => {
-        undoStack.current = [];
-        redoStack.current = [];
-        burstOpen.current = false;
-        clearTimeout(burstTimer.current);
+        const resetHistory = shouldResetEditorHistory(previousLoadToken.current, loadToken);
+        previousLoadToken.current = loadToken;
+        if (resetHistory) {
+            history.undo = [];
+            history.redo = [];
+            burstOpen.current = false;
+            clearTimeout(burstTimer.current);
+        }
         setBlocks(prev => prev.some(b => !b.__uid)
             ? prev.map(b => (b.__uid ? b : { ...b, __uid: nextBlockUid() }))
             : prev);
-        force();
+        if (resetHistory) force();
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [loadToken]);
 
     const snapshot = () => blocks.map(b => ({ ...b, words: b.words ? [...b.words] : b.words }));
 
     const pushUndo = () => {
-        undoStack.current.push(snapshot());
-        if (undoStack.current.length > 200) undoStack.current.shift();
-        redoStack.current = [];
+        history.undo.push(snapshot());
+        if (history.undo.length > 200) history.undo.shift();
+        history.redo = [];
     };
 
     const endBurst = () => {
@@ -736,6 +783,10 @@ export default function Editor({ blocks, setBlocks, onSyncPlayhead, loadToken, r
             const block = prev[blockIndex];
             if (!block.words || !block.words[wordIndex]) return prev;
 
+            // Clearing the inline spelling field must not silently delete the
+            // timed word (or the entire phrase when it is the only word).
+            if (!String(newText || '').trim()) return prev;
+
             const originalWord = block.words[wordIndex];
             const newWords = newText.split(/\s+/).filter(Boolean);
 
@@ -788,17 +839,17 @@ export default function Editor({ blocks, setBlocks, onSyncPlayhead, loadToken, r
 
     const undo = () => {
         endBurst();
-        if (!undoStack.current.length) return;
-        redoStack.current.push(snapshot());
-        setBlocks(undoStack.current.pop());
+        if (!history.undo.length) return;
+        history.redo.push(snapshot());
+        setBlocks(history.undo.pop());
         force();
     };
 
     const redo = () => {
         endBurst();
-        if (!redoStack.current.length) return;
-        undoStack.current.push(snapshot());
-        setBlocks(redoStack.current.pop());
+        if (!history.redo.length) return;
+        history.undo.push(snapshot());
+        setBlocks(history.redo.pop());
         force();
     };
 
@@ -834,6 +885,8 @@ export default function Editor({ blocks, setBlocks, onSyncPlayhead, loadToken, r
     React.useEffect(() => {
         const onKey = (e) => {
             const mod = e.ctrlKey || e.metaKey;
+            if (mod && isTextEditingTarget(e.target)
+                && (e.code === 'KeyZ' || e.code === 'KeyY' || e.code === 'KeyF')) return;
             if (mod && e.code === 'KeyZ' && !e.shiftKey) { e.preventDefault(); undo(); }
             else if ((mod && e.code === 'KeyY') || (mod && e.shiftKey && e.code === 'KeyZ')) { e.preventDefault(); redo(); }
             else if (mod && e.code === 'KeyF') { e.preventDefault(); searchOpen ? closeSearch() : openSearch(); }
@@ -861,8 +914,8 @@ export default function Editor({ blocks, setBlocks, onSyncPlayhead, loadToken, r
             <div className="editor-header">
                 <span className="editor-count">{blocks.length} {countLabel}</span>
                 <span className="grow" />
-                <button className="icon-btn tip-end" data-tip="Undo (Ctrl+Z)" disabled={!undoStack.current.length} onClick={undo}><Undo /></button>
-                <button className="icon-btn tip-end" data-tip="Redo (Ctrl+Y)" disabled={!redoStack.current.length} onClick={redo}><Redo /></button>
+                <button className="icon-btn tip-end" data-tip="Undo (Ctrl+Z)" disabled={!history.undo.length} onClick={undo}><Undo /></button>
+                <button className="icon-btn tip-end" data-tip="Redo (Ctrl+Y)" disabled={!history.redo.length} onClick={redo}><Redo /></button>
                 <button className={'icon-btn tip-end' + (searchOpen ? ' active' : '')} data-tip="Find (Ctrl+F)" onClick={() => (searchOpen ? closeSearch() : openSearch())}><Search /></button>
             </div>
 

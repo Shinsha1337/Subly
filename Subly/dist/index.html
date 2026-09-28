@@ -1,10 +1,15 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'" />
+  <!-- The UI is fully local and makes no network requests of its own. The CSP
+       meta above is injected by vite.config.js into the PRODUCTION build only:
+       the dev server needs an open connect-src for its HMR websocket. -->
   <title>Subly</title>
-  <script type="module" crossorigin src="./assets/index-D1QLMPk0.js"></script>
-  <link rel="stylesheet" crossorigin href="./assets/index-DaDQeJk_.css">
+  <script type="module" crossorigin src="./assets/index-B44WLydr.js"></script>
+  <link rel="stylesheet" crossorigin href="./assets/index-B_zgTCJe.css">
 </head>
 <body>
   <div id="root"></div>

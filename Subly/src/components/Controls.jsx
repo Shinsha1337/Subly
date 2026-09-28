@@ -147,7 +147,7 @@ export function Slider({ label, value, min, max, step, decimals = 3, snap = null
                 <input
                     type="range"
                     min={min} max={max} step={step} value={value}
-                    style={{ background: `linear-gradient(to right, #493D90 0%, #493D90 ${pct}%, var(--slider-track) ${pct}%, var(--slider-track) 100%)` }}
+                    style={{ '--fill': pct + '%' }}
                     onChange={handleRange}
                 />
                 <input

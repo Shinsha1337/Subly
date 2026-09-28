@@ -26,6 +26,7 @@ export default function SettingsModal({ cfg, setCfg, onClose, onApplyConfig }) {
     const [renameVal, setRenameVal] = useState('');
     const [adding, setAdding] = useState(false);
     const [newName, setNewName] = useState('');
+    const [confirmingDelete, setConfirmingDelete] = useState(false);
     const [isClosing, setIsClosing] = useState(false);
     const [hasScroll, setHasScroll] = useState(false);
     const scrollRef = useRef(null);
@@ -33,9 +34,18 @@ export default function SettingsModal({ cfg, setCfg, onClose, onApplyConfig }) {
 
     const set = (k, v) => setData(prev => ({ ...prev, [k]: v }));
 
-    function persist(next) {
-        setCfg(next);
-        window.configAPI.set(next);
+    // Send only the fields this modal owns. A whole-cfg snapshot would clobber
+    // emphasis_colors / favorite_fonts that the Deliver toolbar saved on its own
+    // since this modal mounted. config:set merges and returns the merged result,
+    // which is what the rest of the app should then apply.
+    function persist(patch) {
+        return window.configAPI.set(patch)
+            .then(saved => { if (saved) setCfg(saved); return saved; })
+            .catch(() => null);
+    }
+
+    function persistAndApply(patch) {
+        persist(patch).then(saved => { if (saved) onApplyConfig(saved); });
     }
 
     function handleClose() {
@@ -50,9 +60,7 @@ export default function SettingsModal({ cfg, setCfg, onClose, onApplyConfig }) {
 
     function switchPreset(name) {
         loadPreset(name);
-        const next = { ...cfg, active_preset: name };
-        persist(next);
-        onApplyConfig(next);
+        persistAndApply({ active_preset: name });
     }
 
     function createPreset() {
@@ -60,15 +68,12 @@ export default function SettingsModal({ cfg, setCfg, onClose, onApplyConfig }) {
         setAdding(false);
         setNewName('');
         if (!name || cfg.presets[name]) return;
-        const next = {
-            ...cfg,
-            active_preset: name,
-            presets: { ...cfg.presets, [name]: { ...DEFAULT_PRESET } }
-        };
         setActivePreset(name);
         setData({ ...DEFAULT_PRESET });
-        persist(next);
-        onApplyConfig(next);
+        persistAndApply({
+            active_preset: name,
+            presets: { ...cfg.presets, [name]: { ...DEFAULT_PRESET } }
+        });
     }
 
     function commitRename() {
@@ -78,32 +83,28 @@ export default function SettingsModal({ cfg, setCfg, onClose, onApplyConfig }) {
         const presets = { ...cfg.presets };
         presets[name] = presets[activePreset];
         delete presets[activePreset];
-        const next = { ...cfg, active_preset: name, presets };
         setActivePreset(name);
-        persist(next);
-        onApplyConfig(next);
+        persistAndApply({ active_preset: name, presets });
     }
 
-    function deletePreset() {
+    // Deleting rewrites settings.json immediately and there is no undo, so the
+    // Delete button only arms this — the actual removal needs a second click.
+    function confirmDelete() {
+        setConfirmingDelete(false);
         if (presetNames.length <= 1) return;
         const presets = { ...cfg.presets };
         delete presets[activePreset];
         const nextName = Object.keys(presets)[0];
-        const next = { ...cfg, active_preset: nextName, presets };
         loadPreset(nextName);
-        persist(next);
-        onApplyConfig(next);
+        persistAndApply({ active_preset: nextName, presets });
     }
 
     function saveSettings() {
         const clean = { ...data, max_frames: parseInt(data.max_frames, 10) || 10 };
-        const next = {
-            ...cfg,
+        persistAndApply({
             active_preset: activePreset,
             presets: { ...cfg.presets, [activePreset]: clean }
-        };
-        persist(next);
-        onApplyConfig(next);
+        });
         handleClose();
     }
 
@@ -119,7 +120,7 @@ export default function SettingsModal({ cfg, setCfg, onClose, onApplyConfig }) {
             if (ro) ro.disconnect();
             window.removeEventListener('resize', update);
         };
-    }, [data, renaming, adding, activePreset]);
+    }, [data, renaming, adding, confirmingDelete, activePreset]);
 
     return (
         <div className={`modal-overlay${isClosing ? ' closing' : ''}`} onClick={handleClose}>
@@ -150,6 +151,13 @@ export default function SettingsModal({ cfg, setCfg, onClose, onApplyConfig }) {
                             <button className="btn-gray" disabled={!newName.trim() || !!cfg.presets[newName.trim()]} onClick={createPreset}>Add</button>
                             <button className="btn-gray" onClick={() => { setAdding(false); setNewName(''); }}>Cancel</button>
                         </div>
+                    ) : confirmingDelete ? (
+                        <div className="inline-row">
+                            <span className="preset-label">Delete?</span>
+                            <span className="preset-confirm grow">“{activePreset}” is removed permanently — there is no undo.</span>
+                            <button className="btn-gray" autoFocus onClick={() => setConfirmingDelete(false)}>Cancel</button>
+                            <button className="btn-danger" onClick={confirmDelete}>Delete</button>
+                        </div>
                     ) : (
                         <div className="inline-row">
                             <span className="preset-label">Preset:</span>
@@ -161,7 +169,7 @@ export default function SettingsModal({ cfg, setCfg, onClose, onApplyConfig }) {
                             />
                             <button className="btn-gray" onClick={() => setAdding(true)}>New</button>
                             <button className="btn-gray" onClick={() => { setRenameVal(activePreset); setRenaming(true); }}>Rename</button>
-                            <button className="btn-gray" disabled={presetNames.length <= 1} onClick={deletePreset}>Delete</button>
+                            <button className="btn-gray" disabled={presetNames.length <= 1} onClick={() => setConfirmingDelete(true)}>Delete</button>
                         </div>
                     )}
 
@@ -198,7 +206,7 @@ export default function SettingsModal({ cfg, setCfg, onClose, onApplyConfig }) {
                     <hr className="divider" />
 
                     <div className="inline-row">
-                        <span className="preset-label">Text Case:</span>
+                        <span className="preset-label" style={{ minWidth: 'auto' }}>Text Case:</span>
                         <Chips
                             options={[{ value: 'Auto', label: 'Aa' }, { value: 'lowercase', label: 'aa' }, { value: 'UPPERCASE', label: 'AA' }]}
                             value={data.text_case}
@@ -212,11 +220,13 @@ export default function SettingsModal({ cfg, setCfg, onClose, onApplyConfig }) {
                         <span className="preset-label">Remove Punctuation:</span>
                         <Toggle value={data.rm_punct} onChange={(v) => set('rm_punct', v)} />
                         {data.rm_punct && (
-                            <MultiChips
-                                options={PUNCT_OPTS}
-                                values={data}
-                                onToggle={(key) => set(key, !data[key])}
-                            />
+                            <div className="punct-chips">
+                                <MultiChips
+                                    options={PUNCT_OPTS}
+                                    values={data}
+                                    onToggle={(key) => set(key, !data[key])}
+                                />
+                            </div>
                         )}
                     </div>
 
@@ -230,7 +240,7 @@ export default function SettingsModal({ cfg, setCfg, onClose, onApplyConfig }) {
                                 <span className="preset-label" style={{ minWidth: 'auto' }}>Max Frames:</span>
                                 <input
                                     className="slider-val"
-                                    style={{ width: 38, padding: '6px 4px' }}
+                                    style={{ width: 38, height: 26, padding: '0 4px', boxSizing: 'border-box' }}
                                     value={data.max_frames}
                                     onChange={(e) => set('max_frames', e.target.value.replace(/[^0-9]/g, '').slice(0, 3))}
                                     onBlur={(e) => {
@@ -245,7 +255,6 @@ export default function SettingsModal({ cfg, setCfg, onClose, onApplyConfig }) {
 
                     <button className="btn-primary" onClick={saveSettings}>Save Settings</button>
                 </div>
-                <div className="modal-byline">Subly · by shinsha</div>
                 </div>
             </div>
         </div>
