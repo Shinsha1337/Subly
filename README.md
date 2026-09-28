@@ -16,7 +16,7 @@ phrase regrouping, per-word emphasis, and a built-in editor. Subly runs inside
   <a href="#development"><strong>Development</strong></a>
 </p>
 
-<img width="1140" height="1008" alt="Subly running in DaVinci Resolve Studio" src="https://github.com/user-attachments/assets/ca99c8ba-f6de-41f6-8132-f797c5e35b42" />
+<img width="1221" height="1019" alt="image" src="https://github.com/user-attachments/assets/d4065e9f-62ec-409a-8ab9-fb89dfd471d2" />
 
 ## Features
 
