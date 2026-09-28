@@ -1,7 +1,11 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="UTF-8">
+  <!--CSP-->
+  <!-- The UI is fully local and makes no network requests of its own. The CSP
+       meta above is injected by vite.config.js into the PRODUCTION build only:
+       the dev server needs an open connect-src for its HMR websocket. -->
   <title>Subly</title>
   <link rel="stylesheet" type="text/css" href="./css/styles.css" />
 </head>

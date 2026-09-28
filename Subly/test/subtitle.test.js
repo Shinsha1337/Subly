@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import * as subtitle from '../src/logic/subtitle.js';
 import {
     tcToMs,
     msToTc,
@@ -28,6 +29,21 @@ describe('timecode conversion', () => {
 
     it('clamps negative ms to zero', () => {
         expect(msToTc(-5)).toBe('00:00:00,000');
+    });
+
+    it('normalizes user-entered timecodes and rejects malformed fields', () => {
+        expect(subtitle.normalizeTimecode('1:2:3.4')).toBe('01:02:03,400');
+        expect(subtitle.normalizeTimecode('00:59:59.999')).toBe('00:59:59,999');
+        expect(subtitle.normalizeTimecode('00:60:00,000')).toBeNull();
+        expect(subtitle.normalizeTimecode('00:00:01,000 junk')).toBeNull();
+        expect(subtitle.normalizeTimecode('not a timecode')).toBeNull();
+    });
+
+    it('rejects an inverted or zero-length time range', () => {
+        expect(subtitle.isValidTimeRange('00:00:01,000', '00:00:02,000')).toBe(true);
+        expect(subtitle.isValidTimeRange('00:00:02,000', '00:00:01,000')).toBe(false);
+        expect(subtitle.isValidTimeRange('00:00:01,000', '00:00:01,000')).toBe(false);
+        expect(subtitle.isValidTimeRange('bad', '00:00:01,000')).toBe(false);
     });
 });
 
@@ -70,6 +86,25 @@ describe('syncWordsToText', () => {
             expect(tcToMs(words[i].start)).toBeGreaterThanOrEqual(tcToMs(words[i - 1].end));
         }
     });
+
+    // Regression: this splits on every keystroke in the Deliver editor. A plain
+    // /\s+/ split collapsed an edited CJK phrase into a single "word", throwing
+    // away the per-word timing and emphasis the grouping had just produced.
+    it('segments CJK edits instead of collapsing them into one word', () => {
+        const words = syncWordsToText({
+            start: '00:00:00,000',
+            end: '00:00:03,000',
+            words: [
+                { text: '今日', start: '00:00:00,000', end: '00:00:01,500' },
+                { text: 'は', start: '00:00:01,500', end: '00:00:03,000' }
+            ]
+        }, '今日はいい天気');
+
+        expect(words.length).toBeGreaterThan(1);
+        expect(words.map(w => w.text).join('')).toBe('今日はいい天気');
+        expect(words.every(w => !/\s/.test(w.text))).toBe(true);
+        expect(tcToMs(words.at(-1).end)).toBeLessThanOrEqual(3000);
+    });
 });
 
 describe('applyFormatting — case', () => {
@@ -84,6 +119,20 @@ describe('applyFormatting — case', () => {
 
     it('handles Cyrillic in Auto case', () => {
         expect(applyFormatting([{ text: 'привет. мир' }], { text_case: 'Auto' })[0].text).toBe('Привет. Мир');
+    });
+
+    // Regression: an ASCII+Cyrillic letter class let accented starts fall
+    // through and capitalized the SECOND letter (über -> üBer, ça -> çA).
+    it('Auto capitalizes accented Latin sentence starts', () => {
+        expect(applyFormatting([{ text: 'über alles. étude finie' }], { text_case: 'Auto' })[0].text)
+            .toBe('Über alles. Étude finie');
+        expect(applyFormatting([{ text: 'ça va. école ouverte' }], { text_case: 'Auto' })[0].text)
+            .toBe('Ça va. École ouverte');
+    });
+
+    it('Auto skips non-letters and capitalizes the first real letter', () => {
+        expect(applyFormatting([{ text: '123 abc. — def' }], { text_case: 'Auto' })[0].text)
+            .toBe('123 Abc. — Def');
     });
 });
 
@@ -181,6 +230,227 @@ describe('smartRegroupSubs', () => {
     });
 });
 
+// Segmentation assertions stay ICU-version agnostic: the exact tokens a
+// dictionary picks may shift between Node/Electron builds, so we assert the
+// invariants instead (round-trip, no invented spaces, phrase counts).
+describe('smartRegroupSubs — CJK segmentation', () => {
+    const block = (start, end, text) => ({ start, end, text });
+    const JA = '今日はいい天気ですね本当に気持ちがいいです';
+    const ZH = '我们今天去公园玩得很开心真的很棒';
+
+    it('mode 0 splits Japanese into several words (was one token)', () => {
+        const res = smartRegroupSubs([block('00:00:00,000', '00:00:04,000', JA)], 0, 1, 6, {});
+        expect(res.length).toBeGreaterThan(1);
+        expect(res.map(r => r.text).join('')).toBe(JA);
+    });
+
+    it('mode 0 splits Chinese into several words (was one token)', () => {
+        const res = smartRegroupSubs([block('00:00:00,000', '00:00:04,000', ZH)], 0, 1, 6, {});
+        expect(res.length).toBeGreaterThan(1);
+        expect(res.map(r => r.text).join('')).toBe(ZH);
+    });
+
+    it('mode 2 honours the word cap on Chinese and never invents a space', () => {
+        const res = smartRegroupSubs([block('00:00:00,000', '00:00:04,000', ZH)], 2, 2, 100, {});
+        expect(res.length).toBeGreaterThan(1);
+        for (const r of res) {
+            expect(r.words.length).toBeLessThanOrEqual(2);
+            expect(r.text).not.toMatch(/\s/);
+        }
+        expect(res.map(r => r.text).join('')).toBe(ZH);
+    });
+
+    it('mode 1 wraps Japanese into lines without inserting spaces', () => {
+        const res = smartRegroupSubs([block('00:00:00,000', '00:00:04,000', JA)], 1, 1, 6, { wsMaxChars: 18 });
+        expect(res).toHaveLength(1);
+        const lines = res[0].text.split('\n');
+        expect(lines.length).toBeLessThanOrEqual(2);
+        for (const line of lines) expect([...line].length).toBeLessThanOrEqual(18);
+        expect(res[0].text.replace(/\n/g, '')).toBe(JA);
+        expect(res[0].text).not.toMatch(/ /);
+    });
+
+    it('mode 1 keeps a short Chinese line on one line, unchanged', () => {
+        const res = smartRegroupSubs([block('00:00:00,000', '00:00:04,000', ZH)], 1, 1, 6, { wsMaxChars: 18 });
+        expect(res).toHaveLength(1);
+        expect(res[0].text).toBe(ZH);
+    });
+
+    // A block boundary is a space in English but nothing at all in Japanese —
+    // joining with ' ' would write a space that was never spoken into Resolve.
+    it('does not put a space between two merged CJK blocks', () => {
+        const res = smartRegroupSubs([
+            block('00:00:00,000', '00:00:02,000', '今日はいい天気ですね'),
+            block('00:00:02,100', '00:00:04,000', '本当に気持ちがいいです')
+        ], 1, 1, 6, { wsMaxChars: 60 });
+        expect(res).toHaveLength(1);
+        expect(res[0].text).toBe(JA);
+    });
+
+    it('still puts a space between two merged Latin blocks', () => {
+        const res = smartRegroupSubs([
+            block('00:00:00,000', '00:00:01,000', 'hello there'),
+            block('00:00:01,100', '00:00:02,000', 'my friend')
+        ], 1, 1, 6, { wsMaxChars: 60 });
+        expect(res).toHaveLength(1);
+        expect(res[0].text).toBe('hello there my friend');
+    });
+
+    it('breaks on the full-width terminators 。！？', () => {
+        const dot = smartRegroupSubs([block('00:00:00,000', '00:00:04,000', '今日は雨。明日は晴れ')], 1, 1, 6, { wsMaxChars: 60 });
+        expect(dot.map(r => r.text)).toEqual(['今日は雨。', '明日は晴れ']);
+
+        const bang = smartRegroupSubs([block('00:00:00,000', '00:00:04,000', 'すごい！本当に')], 1, 1, 6, { wsMaxChars: 60 });
+        expect(bang.map(r => r.text)).toEqual(['すごい！', '本当に']);
+
+        const ask = smartRegroupSubs([block('00:00:00,000', '00:00:04,000', '本当？そうです')], 1, 1, 6, { wsMaxChars: 60 });
+        expect(ask.map(r => r.text)).toEqual(['本当？', 'そうです']);
+    });
+
+    // Regression: the quote-strip class missed ’ ) ] so a terminator hidden
+    // behind them was never seen as a sentence end.
+    it('sees a sentence end behind a closing ’ ) or ]', () => {
+        for (const closer of ['’', ')', ']']) {
+            const res = smartRegroupSubs(
+                [block('00:00:00,000', '00:00:02,000', `done.${closer} next`)], 1, 1, 6, { wsMaxChars: 60 });
+            expect(res.map(r => r.text)).toEqual([`done.${closer}`, 'next']);
+        }
+    });
+
+    // A CJK opening bracket must ride along with the word it opens instead of
+    // becoming a caption that reads just '「'.
+    it('keeps CJK brackets attached and still sees the terminator inside them', () => {
+        const res = smartRegroupSubs(
+            [block('00:00:00,000', '00:00:04,000', '「今日は雨。」明日は晴れ')], 1, 1, 6, { wsMaxChars: 60 });
+        expect(res.map(r => r.text)).toEqual(['「今日は雨。」', '明日は晴れ']);
+        expect(res[0].words[0].text.startsWith('「')).toBe(true);
+    });
+
+    it('degrades to per-character splitting for CJK without Intl.Segmenter', async () => {
+        const real = Intl.Segmenter;
+        delete Intl.Segmenter;
+        try {
+            vi.resetModules();
+            const mod = await import('../src/logic/subtitle.js');
+            const res = mod.smartRegroupSubs([block('00:00:00,000', '00:00:04,000', '今日はいい')], 0, 1, 6, {});
+            expect(res.map(r => r.text)).toEqual(['今', '日', 'は', 'い', 'い']);
+            // Spaced scripts must NOT be shredded by the fallback.
+            const en = mod.smartRegroupSubs([block('00:00:00,000', '00:00:04,000', 'hello there')], 0, 1, 6, {});
+            expect(en.map(r => r.text)).toEqual(['hello', 'there']);
+
+            const mixed = mod.smartRegroupSubs([block('00:00:00,000', '00:00:04,000', 'Hello世界')], 0, 1, 6, {});
+            expect(mixed.map(r => r.text)).toEqual(['Hello', '世', '界']);
+        } finally {
+            Intl.Segmenter = real;
+            vi.resetModules();
+        }
+    });
+
+    // Regression: an opening bracket with no space before it glued onto the
+    // PRECEDING token, so a phrase could end on a dangling 「.
+    it('opening brackets start the token they open, not close the previous one', () => {
+        const res = smartRegroupSubs(
+            [block('00:00:01,000', '00:00:05,000', '今日は「天気」です')], 0, 1, 6, {}
+        );
+        expect(res.map(r => r.text).join('')).toBe('今日は「天気」です');
+        expect(res.some(r => r.text.endsWith('「'))).toBe(false);
+        expect(res.some(r => r.text.includes('「天気'))).toBe(true);
+    });
+
+    it('leaves Latin quoting, hyphenation and decimals as single tokens', () => {
+        const res = smartRegroupSubs(
+            [block('00:00:01,000', '00:00:06,000', 'he said "hello, send e-mail about 3.14')],
+            0, 1, 6, {}
+        );
+        const texts = res.map(r => r.text);
+        expect(texts).toContain('"hello,');
+        expect(texts).toContain('e-mail');
+        expect(texts).toContain('3.14');
+    });
+});
+
+describe('smartRegroupSubs — Whole Sentence length caps', () => {
+    const msTc = (ms) => {
+        const p = (n, w = 2) => String(n).padStart(w, '0');
+        return `${p(Math.floor(ms / 3600000))}:${p(Math.floor(ms / 60000) % 60)}:${p(Math.floor(ms / 1000) % 60)},${p(ms % 1000, 3)}`;
+    };
+    // One block per word with a ~110 ms gap — what Resolve's transcription
+    // actually emits, which is why the 800 ms gap rule almost never fires.
+    const speech = (text, wordMs = 290, gapMs = 110) => text.split(' ').map((w, i) => ({
+        start: msTc(i * (wordMs + gapMs)),
+        end: msTc(i * (wordMs + gapMs) + wordMs),
+        text: w
+    }));
+    const blocks = speech('so then we went down to the river and looked at the boats for a while');
+
+    it('caps an unpunctuated run at 2 wrapped lines', () => {
+        const res = smartRegroupSubs(blocks, 1, 1, 6, { wsMaxChars: 18 });
+        expect(res.length).toBeGreaterThan(1);
+        for (const r of res) {
+            const lines = r.text.split('\n');
+            expect(lines.length).toBeLessThanOrEqual(2);
+            for (const line of lines) expect([...line].length).toBeLessThanOrEqual(18);
+        }
+        expect(res.map(r => r.text.replace(/\n/g, ' ')).join(' '))
+            .toBe(blocks.map(b => b.text).join(' '));
+    });
+
+    // Regression: the caps used to fire unconditionally and could cut a
+    // punctuated sentence in half ("…отравляет тело" + "женщин."). Whole
+    // Sentence must never do that — the caps only exist for run-on speech.
+    it('never splits a sentence that is longer than the caps', () => {
+        const sentence = 'Но к несчастью, яд, который там содержится, отравляет тело женщин.';
+        const res = smartRegroupSubs(speech(sentence), 1, 1, 6, { wsMaxChars: 30 });
+        expect(res.length).toBe(1);
+        expect(res[0].text.replace(/\n/g, ' ')).toBe(sentence);
+    });
+
+    it('still breaks between two complete sentences', () => {
+        const res = smartRegroupSubs(
+            speech('Но к несчастью, яд, который там содержится, отравляет тело женщин. Говорю же тебе это проклятие!'),
+            1, 1, 6, { wsMaxChars: 30 }
+        );
+        expect(res.length).toBe(2);
+        expect(res[0].text.replace(/\n/g, ' ')).toMatch(/женщин\.$/);
+        expect(res[1].text.replace(/\n/g, ' ')).toBe('Говорю же тебе это проклятие!');
+    });
+
+    it('caps an unpunctuated run at 6 seconds', () => {
+        // wsMaxChars is large so only the duration cap can fire here.
+        const res = smartRegroupSubs(blocks, 1, 1, 6, { wsMaxChars: 500 });
+        expect(res.length).toBeGreaterThan(1);
+        for (const r of res) {
+            expect(tcToMs(r.end) - tcToMs(r.start)).toBeLessThanOrEqual(6000);
+        }
+    });
+
+    it('breaks the caps at a word boundary, losing no words', () => {
+        const res = smartRegroupSubs(blocks, 1, 1, 6, { wsMaxChars: 18 });
+        expect(res.flatMap(r => r.words.map(w => w.text))).toEqual(blocks.map(b => b.text));
+    });
+
+    it('without the caps the same run is one 6+ second phrase (the old bug)', () => {
+        const res = smartRegroupSubs(blocks, 1, 1, 6, { wsMaxChars: 500, wsMaxLines: 99, wsMaxDurationMs: 1e9 });
+        expect(res).toHaveLength(1);
+        expect(tcToMs(res[0].end) - tcToMs(res[0].start)).toBeGreaterThan(6000);
+    });
+
+    it('leaves short punctuated speech byte-identical', () => {
+        const res = smartRegroupSubs(speech('hello there. how are you?'), 1, 1, 6, { wsMaxChars: 18 });
+        expect(res.map(r => r.text)).toEqual(['hello there.', 'how are you?']);
+    });
+
+    it('mode 2 counts characters, not UTF-16 units (emoji budget)', () => {
+        // '🌟🌟🌟 ха' is 6 characters but 9 UTF-16 units — with the old
+        // testText.length it blew a 6-char budget and split.
+        const one = smartRegroupSubs([{ start: '00:00:00,000', end: '00:00:01,000', text: '🌟🌟🌟 ха' }], 2, 10, 6, {});
+        expect(one.map(r => r.text)).toEqual(['🌟🌟🌟 ха']);
+
+        const two = smartRegroupSubs([{ start: '00:00:00,000', end: '00:00:01,000', text: '🌟🌟🌟 ха' }], 2, 10, 5, {});
+        expect(two.map(r => r.text)).toEqual(['🌟🌟🌟', 'ха']);
+    });
+});
+
 describe('Deliver grouping: mergePhraseDown', () => {
     const blocks = [
         phrase('Hello there', '00:00:00,000', '00:00:01,000', [W('Hello', '00:00:00,000', '00:00:00,500'), W('there', '00:00:00,500', '00:00:01,000')]),
@@ -199,6 +469,22 @@ describe('Deliver grouping: mergePhraseDown', () => {
     it('is a no-op on the last block', () => {
         const out = mergePhraseDown(blocks, 2);
         expect(out).toBe(blocks);
+    });
+
+    it('does not invent spaces when merging unspaced CJK phrases', () => {
+        const input = [
+            phrase('今日は', '00:00:00,000', '00:00:01,000', [W('今日', '00:00:00,000', '00:00:00,500'), W('は', '00:00:00,500', '00:00:01,000')]),
+            phrase('いい天気', '00:00:01,000', '00:00:02,000', [W('いい', '00:00:01,000', '00:00:01,500'), W('天気', '00:00:01,500', '00:00:02,000')])
+        ];
+        expect(mergePhraseDown(input, 0)[0].text).toBe('今日はいい天気');
+    });
+
+    it('preserves a required Latin-space boundary inside mixed CJK phrases', () => {
+        const input = [
+            phrase('東京 AI', '00:00:00,000', '00:00:01,000', [W('東京', '00:00:00,000', '00:00:00,500'), W('AI', '00:00:00,500', '00:00:01,000')]),
+            phrase('model 日本', '00:00:01,000', '00:00:02,000', [W('model', '00:00:01,000', '00:00:01,500'), W('日本', '00:00:01,500', '00:00:02,000')])
+        ];
+        expect(mergePhraseDown(input, 0)[0].text).toBe('東京 AI model 日本');
     });
 });
 
@@ -223,5 +509,15 @@ describe('Deliver grouping: splitPhraseAtWord', () => {
         const input = [block];
         expect(splitPhraseAtWord(input, 0, 0)).toBe(input);
         expect(splitPhraseAtWord(input, 0, 3)).toBe(input);
+    });
+
+    it('does not invent spaces when splitting an unspaced CJK phrase', () => {
+        const input = [phrase('今日はいい天気', '00:00:00,000', '00:00:03,000', [
+            W('今日は', '00:00:00,000', '00:00:01,000'),
+            W('いい', '00:00:01,000', '00:00:02,000'),
+            W('天気', '00:00:02,000', '00:00:03,000')
+        ])];
+        const out = splitPhraseAtWord(input, 0, 1);
+        expect(out.map(b => b.text)).toEqual(['今日は', 'いい天気']);
     });
 });

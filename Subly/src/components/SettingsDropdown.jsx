@@ -35,8 +35,13 @@ export default function SettingsDropdown({ onOpenSettings, theme, onThemeChange 
     const [open, setOpen] = useState(false);
     const [closing, setClosing] = useState(false);
     const [heartHover, setHeartHover] = useState(false);
+    const [version, setVersion] = useState('');
     const ref = useRef(null);
     const closeTimerRef = useRef(null);
+
+    useEffect(() => {
+        window.windowAPI.getVersion?.().then(v => { if (v) setVersion(v); }).catch(() => {});
+    }, []);
 
     const clearCloseTimer = () => {
         if (closeTimerRef.current) {
@@ -81,6 +86,9 @@ export default function SettingsDropdown({ onOpenSettings, theme, onThemeChange 
         // Use mousedown so we catch the click before any other handler
         window.addEventListener('mousedown', handler);
         return () => window.removeEventListener('mousedown', handler);
+        // closeMenu intentionally closes over the current animation state; this
+        // listener is already refreshed whenever that state changes.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [open, closing]);
 
     const handleOpenSettings = () => {
@@ -95,6 +103,9 @@ export default function SettingsDropdown({ onOpenSettings, theme, onThemeChange 
         <div className="settings-dropdown" ref={ref}>
             <button
                 className={`icon-btn${open ? ' active' : ''}`}
+                aria-label="Settings menu"
+                aria-haspopup="menu"
+                aria-expanded={open}
                 onClick={toggleMenu}
             >
                 <Settings />
@@ -140,6 +151,10 @@ export default function SettingsDropdown({ onOpenSettings, theme, onThemeChange 
                             <DesktopIcon />
                         </button>
                     </div>
+                    <div className="dropdown-sep" />
+                    {/* Quiet branding: lives here instead of the presets modal
+                        footer so it never competes with actual controls. */}
+                    <div className="dropdown-version">Subly{version ? ` v${version}` : ''} · by shinsha</div>
                 </div>
             )}
         </div>

@@ -1,4 +1,4 @@
-import { Play, Refresh, Folder } from './Icons';
+import { Play, Refresh, Folder, Waveform } from './Icons';
 import { Toggle, Slider, Chips, MultiChips, Select } from './Controls';
 import { wordsToChars } from '../logic/subtitle';
 import { LANGUAGES, PUNCT_OPTS } from '../constants/options';
@@ -13,8 +13,16 @@ export default function ControlPanel(props) {
         size, setSize, posX, setPosX, posY, setPosY,
         textCase, setTextCase, rmPunct, setRmPunct, punctSel, setPunctSel,
         fillGaps, setFillGaps, maxFrames, setMaxFrames, createCaptions,
-        busy, hasOriginalBlocks, hasPhrasesBlocks
+        busy, connected, hasOriginalBlocks, hasPhrasesBlocks
     } = props;
+
+    // Every action button's `disabled` must mirror the guard in its App handler,
+    // otherwise the button looks live and the click is a silent no-op.
+    const blocked = !!busy || !connected;
+
+    // Nothing loaded and no track to pull from: transcribing is the only way
+    // forward, so the button stops being one option among several and says so.
+    const needsTranscribe = !blocked && tracks.length === 0 && !hasOriginalBlocks;
 
     return (
         <div
@@ -33,10 +41,10 @@ export default function ControlPanel(props) {
                                 : templates.map(t => ({ value: t, label: t }))}
                             onChange={(v) => setTemplate(v)}
                         />
-                        <button className="icon-square tip-end" data-tip="Import bundled bin" onClick={importBin}><Folder /></button>
-                        <button className="icon-square tip-end" data-tip="Refresh templates" onClick={refreshTemplates}><Refresh /></button>
+                        <button className="icon-square tip-end" aria-label="Import bundled bin" data-tip="Import bundled bin" disabled={blocked} onClick={importBin}><Folder /></button>
+                        <button className="icon-square tip-end" aria-label="Refresh templates" data-tip="Refresh templates" disabled={blocked} onClick={refreshTemplates}><Refresh /></button>
                     </div>
-                    <button className="btn-primary" disabled={!!busy} onClick={setPreviewCaption}>
+                    <button className="btn-primary" disabled={blocked || !template} onClick={setPreviewCaption}>
                         <Play /> Set Preview Caption
                     </button>
                 </div>
@@ -53,10 +61,18 @@ export default function ControlPanel(props) {
                             options={LANGUAGES.map(l => ({ value: l, label: l }))}
                             onChange={(v) => setLanguage(v)}
                         />
-                        <div className="row between">
-                            <span className="field-label">Subtitle Track</span>
-                            <button className="btn-gray" disabled={!!busy} onClick={transcribe}>Transcribe Audio</button>
-                        </div>
+                        {/* Belongs under Language: this acts on the language
+                            select above and always creates a NEW track, so
+                            sitting in the Subtitle Track row read as if it
+                            transcribed into the selected one. */}
+                        <button
+                            className={'btn-gray transcribe-btn' + (needsTranscribe ? ' attention' : '')}
+                            disabled={blocked}
+                            onClick={transcribe}
+                        >
+                            <Waveform /> Transcribe Audio
+                        </button>
+                        <span className="field-label">Subtitle Track</span>
                         <div className="row">
                             <Select
                                 className="grow"
@@ -64,17 +80,20 @@ export default function ControlPanel(props) {
                                 options={tracks.length === 0
                                     ? [{ value: '', label: 'No tracks — Refresh' }]
                                     : tracks.map(t => ({ value: t.idx, label: t.name }))}
-                                onChange={(v) => setTrack(Number(v))}
+                                // The "No tracks" placeholder is a selectable option with an
+                                // empty value; Number('') is 0, which passes every `track == null`
+                                // guard and then silently resolves to track 1 in the backend.
+                                onChange={(v) => setTrack(v === '' ? null : Number(v))}
                             />
-                            <button className="icon-square tip-end" data-tip="Refresh tracks" onClick={refreshTracks}><Refresh /></button>
+                            <button className="icon-square tip-end" aria-label="Refresh tracks" data-tip="Refresh tracks" disabled={blocked} onClick={refreshTracks}><Refresh /></button>
                         </div>
                     </div>
 
                     <div className="card">
                         <span className="card-label">Timeline Sync</span>
-                        <div className="row">
-                            <button className="btn-gray grow tip-start" data-tip="Send subtitles to DaVinci Resolve for timeline editing: fix timing and text errors there, then Pull back" disabled={!!busy || !hasOriginalBlocks} onClick={applyToResolve}>Apply to Resolve</button>
-                            <button className="btn-gray grow tip-end" data-tip="Load subtitles from the selected track into the editor" disabled={!!busy} onClick={pullFromResolve}>Pull from Resolve</button>
+                        <div className="row sync-row">
+                            <button className="btn-gray grow tip-start" data-tip="Send subtitles to DaVinci Resolve for timeline editing: fix timing and text errors there, then Pull back" disabled={blocked || !hasOriginalBlocks || track == null} onClick={applyToResolve}>Apply to Resolve</button>
+                            <button className="btn-gray grow tip-end" data-tip="Load subtitles from the selected track into the editor" disabled={blocked || track == null} onClick={pullFromResolve}>Pull from Resolve</button>
                         </div>
                     </div>
 
@@ -100,7 +119,7 @@ export default function ControlPanel(props) {
                                 <Slider label="Max Character Amount" value={maxChars} min={6} max={50} step={1} decimals={0} onChange={setMaxChars} />
                             </>
                         )}
-                        <button className="btn-primary" disabled={!!busy || !hasOriginalBlocks} onClick={createPhrases}>
+                        <button className="btn-primary" disabled={blocked || !hasOriginalBlocks} onClick={createPhrases}>
                             <Play /> Create Phrases
                         </button>
                     </div>
@@ -116,7 +135,7 @@ export default function ControlPanel(props) {
                     </div>
                     <div className="card">
                         <div className="row">
-                            <span className="strong-label">Text case</span>
+                            <span className="strong-label">Text case:</span>
                             <Chips
                                 options={[{ value: 'Auto', label: 'Aa' }, { value: 'lowercase', label: 'aa' }, { value: 'UPPERCASE', label: 'AA' }]}
                                 value={textCase}
@@ -125,7 +144,7 @@ export default function ControlPanel(props) {
                         </div>
                         <hr className="divider" />
                         <div className="row">
-                            <span className="strong-label">Remove punctuation</span>
+                            <span className="strong-label">Remove punctuation:</span>
                             <Toggle value={rmPunct} onChange={setRmPunct} />
                         </div>
                         {rmPunct && (
@@ -136,30 +155,28 @@ export default function ControlPanel(props) {
                             />
                         )}
                         <hr className="divider" />
-                        <div className="row between" style={{ flexWrap: 'nowrap' }}>
-                            <div className="row">
-                                <span className="strong-label">Fill Gaps</span>
-                                <Toggle value={fillGaps} onChange={setFillGaps} />
-                            </div>
-                            {fillGaps && (
-                                <div className="row" style={{ flexWrap: 'nowrap' }}>
-                                    <span className="strong-label">Max Frames</span>
-                                    <input
-                                        className="slider-val"
-                                        style={{ width: 38, padding: '6px 4px' }}
-                                        value={maxFrames}
-                                        onChange={(e) => setMaxFrames(e.target.value.replace(/[^0-9]/g, '').slice(0, 3))}
-                                        onBlur={(e) => {
-                                            const n = parseInt(e.target.value, 10);
-                                            setMaxFrames(String(Number.isFinite(n) ? Math.min(100, Math.max(1, n)) : 10));
-                                        }}
-                                        inputMode="numeric"
-                                    />
-                                </div>
-                            )}
+                        <div className="row">
+                            <span className="strong-label">Fill Gaps:</span>
+                            <Toggle value={fillGaps} onChange={setFillGaps} />
                         </div>
+                        {fillGaps && (
+                            <div className="row">
+                                <span className="strong-label">Max Frames:</span>
+                                <input
+                                    className="slider-val"
+                                    style={{ width: 44, padding: '6px 4px' }}
+                                    value={maxFrames}
+                                    onChange={(e) => setMaxFrames(e.target.value.replace(/[^0-9]/g, '').slice(0, 3))}
+                                    onBlur={(e) => {
+                                        const n = parseInt(e.target.value, 10);
+                                        setMaxFrames(String(Number.isFinite(n) ? Math.min(100, Math.max(1, n)) : 10));
+                                    }}
+                                    inputMode="numeric"
+                                />
+                            </div>
+                        )}
                     </div>
-                    <button className="btn-primary" disabled={!!busy || !hasPhrasesBlocks} onClick={createCaptions}>
+                    <button className="btn-primary" disabled={blocked || !hasPhrasesBlocks || !template} onClick={createCaptions}>
                         <Play /> Create Captions
                     </button>
                 </>

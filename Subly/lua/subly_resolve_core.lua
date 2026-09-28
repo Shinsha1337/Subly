@@ -5,6 +5,8 @@ local PORT = tonumber(os.getenv("SUBLY_PORT")) or 56003
 local AUTH_TOKEN = os.getenv("SUBLY_TOKEN")
 local socket = nil
 local json = nil
+local text_spans = nil
+pcall(function() text_spans = require("text_spans") end)
 local resolve = rawget(_G, "resolve")
 if not resolve and type(rawget(_G, "Resolve")) == "function" then
     resolve = Resolve()
@@ -325,7 +327,11 @@ local function get_text_plus_tool(clip)
     return nil
 end
 
-local function get_auto_subs_tool(clip)
+-- Finds the caption macro driving this clip. SmartSubs is matched by name; the
+-- scan below also accepts any macro exposing the same contract (WordTiming +
+-- DelaySpline data plus an ApplyWordTiming function), so a SmartSubs-shaped
+-- template under a different name still works.
+local function get_smartsubs_tool(clip)
     local ok, comp = pcall(function() return clip:GetFusionCompByIndex(1) end)
     if not ok or not comp then return nil, nil end
 
@@ -351,7 +357,11 @@ local function get_auto_subs_tool(clip)
     return comp, nil
 end
 
-local function build_text_word_spans(text)
+local function build_text_word_spans(text, words)
+    if text_spans then
+        return text_spans.build(text, words)
+    end
+
     local spans = {}
     local chars = utf8_chars(text)
     local in_word = false
@@ -390,10 +400,10 @@ local function build_text_word_spans(text)
     return spans
 end
 
-local function build_autosubs_word_timing(block, fps, text_value)
+local function build_smartsubs_word_timing(block, fps, text_value)
     local timing = {}
     local start_frame = tc_to_frame(block.start, fps)
-    local spans = build_text_word_spans(text_value or block.text or "")
+    local spans = build_text_word_spans(text_value or block.text or "", block.words)
 
     for i, word in ipairs(block.words or {}) do
         local span = spans[i]
@@ -467,13 +477,94 @@ local function build_word_emphasis_styles(block, spans, base_size)
     return arr
 end
 
-local function apply_word_emphasis(comp, tool, block, text_value, pc_settings)
-    if not comp or not tool or not block or type(block.words) ~= "table" then return false end
-    local spans = build_text_word_spans(text_value or block.text or "")
-    if #spans == 0 then return false end
+-- Returns the per-word style entries for a block, or nil when there is nothing
+-- to emphasise.
+local function build_block_emphasis_styles(block, text_value, pc_settings)
+    if not block or type(block.words) ~= "table" then return nil end
+    local spans = build_text_word_spans(text_value or block.text or "", block.words)
+    if #spans == 0 then return nil end
     local base_size = pc_settings and pc_settings.Size or 0.07
     local styles = build_word_emphasis_styles(block, spans, base_size)
-    if #styles == 0 then return false end
+    if #styles == 0 then return nil end
+    return styles
+end
+
+-- Merges Subly's per-word styles into whatever keyframes the spline already
+-- carries, then writes them back with SetKeyFrames.
+--
+-- SaveSettings is used for READING ONLY. Do NOT write these splines back with
+-- LoadSettings: that call re-instantiates the tool from a Tools tree. The
+-- The caption macro's spline lives INSIDE the macro's own serialized Tools list
+-- (the macro Tools tree contains the spline). In a live session the
+-- input -> modifier link survives as an in-memory pointer, but the .drp stores
+-- it by name, so after re-materialisation the reference from
+-- CharacterLevelStyling1 no longer resolves on project load — the spline stops
+-- supplying a value, Follower1 then cannot get Text, and MediaOut1 renders
+-- black. SmartSubs itself only ever uses LoadSettings on
+-- Follower1DelaybyCharacterPosition, which sits OUTSIDE the macro (line 531);
+-- for this spline both ApplyHighlight and RemoveHighlight use SetKeyFrames with
+-- the exact same __ctor = "StyledText" payload, so nothing is flattened.
+local function write_emphasis_keyframes(spline, styles)
+    local source = nil
+    pcall(function()
+        local settings = spline:SaveSettings()
+        if settings and settings.Tools and settings.Tools[spline.Name] then
+            source = settings.Tools[spline.Name].KeyFrames
+        end
+    end)
+
+    -- Fresh tables per keyframe: the previous version inserted the same style
+    -- tables into every keyframe's Array, aliasing them across the timeline.
+    local function styled_keyframe(order_index, existing_array, existing_flags)
+        local merged = {}
+        for _, entry in ipairs(existing_array or {}) do
+            table.insert(merged, entry)
+        end
+        for _, style in ipairs(styles) do
+            table.insert(merged, {
+                style[1], style[2], style[3],
+                Value = style.Value,
+                String = style.String,
+                __flags = 256,
+                Index = style.Index or 0
+            })
+        end
+        local flags = { LockedY = true, __flags = 256 }
+        if existing_flags and existing_flags.Linear then flags.Linear = true else flags.StepIn = true end
+        return {
+            tonumber(order_index) or 0,
+            Value = { __ctor = "StyledText", Array = merged, Flags = flags }
+        }
+    end
+
+    local keyframes = {}
+    local count = 0
+    if type(source) == "table" then
+        for frame, kf in pairs(source) do
+            local array, flags = nil, nil
+            pcall(function()
+                array = kf.Value and kf.Value.Array
+                flags = kf.Value and kf.Value.Flags
+            end)
+            if type(array) ~= "table" then array = {} end
+            keyframes[frame] = styled_keyframe(kf[1], array, flags)
+            count = count + 1
+        end
+    end
+    -- No highlight animation on this template — a single keyframe carries the
+    -- static emphasis, which is what the SmartSubs "highlight off" state uses.
+    if count == 0 then
+        keyframes[0] = styled_keyframe(0, {}, nil)
+    end
+
+    local ok_set, set_result = pcall(function() return spline:SetKeyFrames(keyframes, true) end)
+    return ok_set and set_result ~= false
+end
+
+local function apply_word_emphasis(comp, tool, block, text_value, pc_settings)
+    if not comp or not tool then return false end
+    local styles = build_block_emphasis_styles(block, text_value, pc_settings)
+    if not styles then return false end
 
     -- SmartSubs stores the actual Text+ text through Follower1 -> StyledTextCLS.
     -- Snap Captions writes CharacterLevelStyling into the BezierSpline connected
@@ -499,60 +590,92 @@ local function apply_word_emphasis(comp, tool, block, text_value, pc_settings)
     end)
     if not spline then return false end
 
-    -- Do NOT replace SmartSubs highlight keyframes. Merge Subly entries into
-    -- the BezierSpline settings that SmartSubs already generated. Using
-    -- SaveSettings/LoadSettings preserves the rich StyledText keyframe shape;
-    -- GetKeyFrames()/SetKeyFrames() can flatten it in Resolve and break output.
-    local ok_settings, settings = pcall(function() return spline:SaveSettings() end)
-    if ok_settings and settings and settings.Tools and settings.Tools[spline.Name] then
-        local keyframes = settings.Tools[spline.Name].KeyFrames or {}
-        if next(keyframes) == nil then
-            keyframes[0] = {
-                0,
-                Value = {
-                    __ctor = "StyledText",
-                    Array = {},
-                    Flags = { StepIn = true, LockedY = true, __flags = 256 }
-                }
-            }
-        end
-
-        for _, keyframe in pairs(keyframes) do
-            keyframe.Value = keyframe.Value or { __ctor = "StyledText", Array = {}, Flags = { StepIn = true, LockedY = true, __flags = 256 } }
-            keyframe.Value.__ctor = keyframe.Value.__ctor or "StyledText"
-            keyframe.Value.Array = keyframe.Value.Array or {}
-            keyframe.Value.Flags = keyframe.Value.Flags or { StepIn = true, LockedY = true, __flags = 256 }
-            for _, style in ipairs(styles) do
-                table.insert(keyframe.Value.Array, style)
-            end
-        end
-
-        settings.Tools[spline.Name].KeyFrames = keyframes
-        local ok_load = pcall(function() spline:LoadSettings(settings) end)
-        if ok_load then return true end
-    end
-
-    -- Last-resort fallback: apply Subly styles at frame 0. This may override
-    -- animated highlight, but keeps Color/Size/Font functional if Resolve won't
-    -- expose editable spline settings.
-    local keyframes = {
-        [0] = {
-            0,
-            Value = {
-                __ctor = "StyledText",
-                Array = styles,
-                Flags = { StepIn = true, LockedY = true, __flags = 256 }
-            }
-        }
-    }
-    return pcall(function() spline:SetKeyFrames(keyframes, true) end)
+    return write_emphasis_keyframes(spline, styles)
 end
 
-local function apply_autosubs_template(item, block, fps, pc_settings)
+-- A plain Text+ carries the same CharacterLevelStyling input (Resolve 17+), fed
+-- by a BezierSpline whose keyframe Values are StyledText objects. Unlike
+-- SmartSubs, nothing is connected to it until the styling is animated, so the
+-- modifier is attached on demand with the AddModifier -> read the input back
+-- pattern SmartSubs uses for its own splines.
+-- Per-word emphasis on a plain Text+ (no SmartSubs macro in the comp).
+--
+-- Character-level styling is NOT an input on Text+ itself. It is a separate
+-- modifier operator of type StyledTextCLS that drives the Text+ StyledText
+-- input, and the BezierSpline carrying the style keyframes hangs off THAT
+-- operator's CharacterLevelStyling input. The macro's internal graph has this shape:
+--     Template.StyledText  <- Follower1 <- CharacterLevelStyling1 (StyledTextCLS)
+--     CharacterLevelStyling1.CharacterLevelStyling <- BezierSpline
+-- so the chain we have to build for a bare Text+ is
+--     tool.StyledText <- StyledTextCLS <- BezierSpline
+--
+-- Consequence for the caller: once a StyledTextCLS drives StyledText, the
+-- caption string lives on the MODIFIER's Text input. Writing tool.StyledText
+-- after that no longer reaches the render, which is why this function sets the
+-- text on the modifier itself and returns true only when it did.
+local function apply_text_plus_word_emphasis(tool, block, text_value, pc_settings)
+    if not tool then return false end
+    local styles = build_block_emphasis_styles(block, text_value, pc_settings)
+    if not styles then return false end
+
+    -- Reuse an existing modifier if the template already ships one, otherwise
+    -- attach it. AddModifier swaps what the input points at, so every step
+    -- re-reads tool.StyledText instead of holding a stale handle.
+    local cls = nil
+    pcall(function()
+        local out = tool.StyledText:GetConnectedOutput()
+        if out then cls = out:GetTool() end
+    end)
+    if not cls then
+        pcall(function() tool:AddModifier("StyledText", "StyledTextCLS") end)
+        pcall(function()
+            local out = tool.StyledText:GetConnectedOutput()
+            if out then cls = out:GetTool() end
+        end)
+    end
+    -- Text+ older than Resolve 17 has no StyledTextCLS registered; report
+    -- failure rather than raising so those projects degrade to a plain caption.
+    if not cls then return false end
+
+    local spline = nil
+    pcall(function()
+        local out = cls.CharacterLevelStyling:GetConnectedOutput()
+        if out then spline = out:GetTool() end
+    end)
+    if not spline then
+        pcall(function() cls:AddModifier("CharacterLevelStyling", "BezierSpline") end)
+        pcall(function()
+            local out = cls.CharacterLevelStyling:GetConnectedOutput()
+            if out then spline = out:GetTool() end
+        end)
+    end
+    if not spline then return false end
+
+    return write_emphasis_keyframes(spline, styles)
+end
+
+-- Writes the caption where the render actually reads it. A StyledTextCLS
+-- modifier driving StyledText owns the string on its own Text input, so a write
+-- to tool.StyledText is silently ignored — that applies both to the modifier
+-- attached above and to templates that already ship one (which is why such
+-- templates used to render their placeholder text).
+local function set_text_plus_caption(tool, text_value)
+    local cls = nil
+    pcall(function()
+        local out = tool.StyledText:GetConnectedOutput()
+        if out then cls = out:GetTool() end
+    end)
+    if cls then
+        return pcall(function() cls:SetInput("Text", text_value) end)
+    end
+    return pcall(function() tool:SetInput("StyledText", text_value) end)
+end
+
+local function apply_smartsubs_template(item, block, fps, pc_settings)
     if not block or type(block.words) ~= "table" or #block.words == 0 then return false end
 
-    local comp, autosubs_tool = get_auto_subs_tool(item)
-    if not comp or not autosubs_tool then return false end
+    local comp, smartsubs_tool = get_smartsubs_tool(item)
+    if not comp or not smartsubs_tool then return false end
 
     local locked = false
     pcall(function()
@@ -567,35 +690,35 @@ local function apply_autosubs_template(item, block, fps, pc_settings)
         if locked and comp.Unlock then pcall(function() comp:Unlock() end) end
         return false
     end
-    local word_timing = build_autosubs_word_timing(block, fps, text_value)
+    local word_timing = build_smartsubs_word_timing(block, fps, text_value)
     if #word_timing == 0 then
         if locked and comp.Unlock then pcall(function() comp:Unlock() end) end
         return false
     end
-    local ok = pcall(function() autosubs_tool:SetData("WordTiming", word_timing) end)
+    local ok = pcall(function() smartsubs_tool:SetData("WordTiming", word_timing) end)
     if not ok then
         if locked and comp.Unlock then pcall(function() comp:Unlock() end) end
         return false
     end
 
-    -- AutoSubs macro exposes Text as the control input. Its ExecuteOnChange
-    -- updates StyledText, delay keyframes, highlight styling, and stored timing.
-    pcall(function() autosubs_tool:SetInput("Text", text_value) end)
+    -- SmartSubs exposes Text as the control input. Its ExecuteOnChange updates
+    -- StyledText, delay keyframes, highlight styling, and stored timing.
+    pcall(function() smartsubs_tool:SetInput("Text", text_value) end)
     if pc_settings then
-        pcall(function() autosubs_tool:SetInput("TextSize", pc_settings.Size) end)
-        pcall(function() autosubs_tool:SetInput("TextPosition", pc_settings.Center) end)
+        pcall(function() smartsubs_tool:SetInput("TextSize", pc_settings.Size) end)
+        pcall(function() smartsubs_tool:SetInput("TextPosition", pc_settings.Center) end)
     end
 
     local apply_func = nil
-    pcall(function() apply_func = autosubs_tool:GetData("ApplyWordTiming") end)
+    pcall(function() apply_func = smartsubs_tool:GetData("ApplyWordTiming") end)
     if apply_func and apply_func ~= "" then
         pcall(function()
-            loadstring(apply_func)()(comp, autosubs_tool, word_timing)
+            loadstring(apply_func)()(comp, smartsubs_tool, word_timing)
         end)
     end
 
-    pcall(function() autosubs_tool:SetInput("StyledText", text_value) end)
-    pcall(function() apply_word_emphasis(comp, autosubs_tool, block, text_value, pc_settings) end)
+    pcall(function() smartsubs_tool:SetInput("StyledText", text_value) end)
+    pcall(function() apply_word_emphasis(comp, smartsubs_tool, block, text_value, pc_settings) end)
 
     if locked and comp.Unlock then
         pcall(function() comp:Unlock() end)
@@ -1115,12 +1238,17 @@ function SendFusionTextTitles(blocks, template_name, source_track, fill_gaps, ma
         end)
         local ok_apply = pcall(function()
             local block = valid_blocks[i]
-            if not apply_autosubs_template(item, block, fps, pc_settings) then
+            if not apply_smartsubs_template(item, block, fps, pc_settings) then
                 local tool = get_text_plus_tool(item)
                 if tool then
-                    tool:SetInput("StyledText", block.text or "")
+                    local text_value = block.text or ""
                     tool:SetInput("Size", pc_settings.Size)
                     tool:SetInput("Center", pc_settings.Center)
+                    -- Emphasis first: it may attach the StyledTextCLS modifier
+                    -- that then owns the caption string. Best effort — a
+                    -- template that cannot take styling still gets its text.
+                    pcall(function() apply_text_plus_word_emphasis(tool, block, text_value, pc_settings) end)
+                    set_text_plus_caption(tool, text_value)
                 end
             end
         end)

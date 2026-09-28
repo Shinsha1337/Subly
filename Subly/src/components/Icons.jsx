@@ -53,6 +53,13 @@ export const Search = () => (
         <circle cx="11" cy="11" r="7" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
     </svg>
 );
+export const Waveform = () => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+        <line x1="3" y1="10" x2="3" y2="14" /><line x1="7" y1="7" x2="7" y2="17" />
+        <line x1="11" y1="4" x2="11" y2="20" /><line x1="15" y1="8" x2="15" y2="16" />
+        <line x1="19" y1="11" x2="19" y2="13" />
+    </svg>
+);
 export const Razor = () => (
     <svg viewBox="0 0 24 24" fill="currentColor">
         <rect x="2" y="4" width="20" height="2.5" rx="0.5" />
